@@ -1,0 +1,17 @@
+---
+services:
+  api:
+    build:
+      context: .
+      dockerfile: KalkanCore/Dockerfile
+    ports:
+      - "8083:8080"
+    restart: always
+    networks:
+      - default
+      - elastic
+
+networks:
+  elastic:
+    name: elastic-stack_default
+    external: true
