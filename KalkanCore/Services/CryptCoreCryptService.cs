@@ -23,6 +23,9 @@ public class CryptCoreCryptService : ICryptService
     // Shared client for OCSP requests; bounded timeout so verification never blocks long.
     private static readonly HttpClient OcspHttp = new() { Timeout = TimeSpan.FromSeconds(10) };
 
+    // CRLs: the end-entity CRL is ~20 MB, but it is fetched at most once per publication (cached).
+    private static readonly HttpClient CrlHttp = new() { Timeout = TimeSpan.FromSeconds(60) };
+
     public CryptCoreCryptService(IOptions<KalkanOption> options, ILogger<CryptCoreCryptService> logger)
     {
         _logger = logger;
@@ -31,12 +34,14 @@ public class CryptCoreCryptService : ICryptService
         ChainValidator? trust = null;
         if (!string.IsNullOrWhiteSpace(opt.CaCertsPath) && Directory.Exists(opt.CaCertsPath))
         {
-            // OCSP responder is only consulted when the caller passes ValidateOcsp=true
-            // (see Verify); building the checker here is cheap and stateless.
-            var ocsp = new OcspRevocationChecker(OcspHttp, opt.OcspResponderUrl);
-            trust = ChainValidator.FromPemDirectory(opt.CaCertsPath, ocsp);
+            // Revocation is only consulted when the caller passes ValidateOcsp=true (see Verify).
+            // OCSP first; CRL covers the issuing CAs (no OCSP responder) and OCSP outages.
+            var revocation = new CompositeRevocationChecker(
+                new OcspRevocationChecker(OcspHttp, opt.OcspResponderUrl),
+                new CrlRevocationChecker(CrlHttp));
+            trust = ChainValidator.FromPemDirectory(opt.CaCertsPath, revocation);
             _logger.LogInformation(
-                "Загружен trust-store НУЦ РК из {Path}; проверка цепочки включена, OCSP-ответчик: {Url}.",
+                "Загружен trust-store НУЦ РК из {Path}; проверка цепочки включена, отзыв: OCSP ({Url}) → CRL.",
                 opt.CaCertsPath, opt.OcspResponderUrl ?? "из AIA сертификата");
         }
         else

@@ -27,14 +27,33 @@
 - Enum `RevocationStatus { Good, Revoked, Unknown }` + интерфейс. Развязывает `ChainValidator`
   от сети, делает revocation тестируемым.
 
-### `CryptCore/Pki/OcspRevocationChecker.cs` — ✅ OCSP (RFC 6960), ⚠️ wire не проверен вживую
+### `CryptCore/Pki/OcspRevocationChecker.cs` — ✅ OCSP (RFC 6960), проверен вживую
 - Запрос строится через `CertificateID`, POST на ответчик из AIA сертификата
   (fallback — `OcspResponderUrl` из конфига).
-- ГОСТ-aware проверка подписи ответа (вручную через `KzGost`, обе ориентации байт).
+- ГОСТ-aware проверка подписи ответа (через `KzGost.VerifyEitherOrientation`, обе ориентации байт).
 - Не доверяет ответу вслепую: вшитый responder-сертификат должен быть выпущен тем же CA.
 - Сеть/парс-ошибка/недоверенный ответ → `Unknown`.
-- ⚠️ **Hash-алгоритм CertID = SHA-256 по умолчанию** (`CertIdHashAlgorithm`). НУЦ РК может
-  ждать SHA-1 — не подтверждено против живого ответчика. См. раздел «Что нужно сделать».
+- Промежуточные CA НУЦ (`nca_gost_2022`, `nca_rsa`, …) **не имеют OCSP в AIA**, а
+  `ocsp.pki.gov.kz` отвечает на них `malformedRequest`. Для CA-сертификатов без AIA OCSP
+  запрос на fallback-ответчик не шлётся → `Unknown` сразу, их статус даёт CRL корня.
+  (До этого фикса `ValidateOcsp=true` + fail-closed отклонял **любую** подпись.)
+- Живой `ocsp.pki.gov.kz` (проверено 2026-10-27): CertID и с **SHA-256**, и с **SHA-1** → `good`;
+  ответ подписан ГОСТ-2015 сертификатом «OCSP GOST», выпущенным `nca_gost_2022`;
+  **nonce поддерживается** (возвращается в ответе).
+
+### `CryptCore/Pki/CrlRevocationChecker.cs` — ✅ CRL, проверен вживую
+- URL из CDP-расширения сертификата (только http/https), скачивание, проверка, что CRL выпущен
+  издателем сертификата (DN + подпись, ГОСТ — через `KzGost`, RSA — через BouncyCastle).
+- CRL с истёкшим `nextUpdate`, чужой подписью или недоступный → `Unknown`.
+- Кэш в памяти до `nextUpdate` (набор отозванных серийников); одна загрузка на URL одновременно.
+- Размеры НУЦ: CRL корня на промежуточные CA ~0.5 КБ (обновление раз в месяц), CRL НУЦ на
+  конечные сертификаты **~20 МБ** (раз в сутки; загрузка + разбор ≈ 9 с).
+- ⚠️ Delta-CRL (`nca_d_gost_2022.crl`, обновляется каждые ~6 ч) **не читается**: отзыв,
+  сделанный после выпуска базового CRL, виден через CRL только со следующим базовым (до ~1 сут).
+  Для конечных сертификатов это fallback — основной путь OCSP, он актуален.
+
+### `CryptCore/Pki/CompositeRevocationChecker.cs` — ✅ OCSP → CRL
+- Первый определённый ответ (`Good`/`Revoked`) выигрывает; `Unknown` только если все `Unknown`.
 
 ### `CryptCore/Signing/{XmlDsigService,WsseService,CmsService}.cs` — ✅ интеграция
 - Каждый `Verify` принимает `ChainValidator? trust` и `bool checkRevocation`.
@@ -48,43 +67,47 @@
 - Без trust-стора поведение прежнее (обратная совместимость).
 
 ### `KalkanCore/Services/CryptCoreCryptService.cs` — ✅ DI-обвязка
-- Строит `OcspRevocationChecker` (общий `HttpClient`, timeout 10с) + `ChainValidator`
-  из `CaCertsPath`. При отсутствии пути — **WARNING**, что проверка цепочки отключена.
-- `VerifyDto.ValidateOcsp` → `checkRevocation` через весь стек (флаг больше не игнорируется).
+- Строит `CompositeRevocationChecker(OCSP → CRL)` (OCSP: `HttpClient` timeout 10с,
+  CRL: 60с) + `ChainValidator` из `CaCertsPath`. При отсутствии пути — **WARNING**, что
+  проверка цепочки отключена.
+- `VerifyDto.ValidateOcsp` → `checkRevocation` через весь стек (флаг больше не игнорируется;
+  несмотря на имя, включает и CRL).
+- HTTP API: `crypt/verify/xml`, `crypt/verify/xml/base64`, `crypt/verify/wsse`,
+  `crypt/cms/sign`, `crypt/cms/verify`; ответ проверки содержит `Error` с причиной отказа.
 
-### `KalkanCore/BaseOptions/BaseOptions.cs` — ✅ конфиг
-- `KalkanOption.CaCertsPath` — папка PEM-корней (по умолч. отключено = небезопасно).
-- `KalkanOption.OcspResponderUrl` — fallback-URL ответчика.
+### `KalkanCore/BaseOptions/BaseOptions.cs` + `appsettings.json` — ✅ конфиг
+- `KalkanOption.CaCertsPath` — папка PEM-корней; в `appsettings.json` = `/app/Infra/Ca_Certs`.
+- `KalkanOption.OcspResponderUrl` — fallback-URL ответчика; = `http://ocsp.pki.gov.kz`.
 
-### `CryptCore.Tests/` — ✅ 12 тестов, все зелёные
+### `CryptCore.Tests/` — ✅ 23 офлайн-теста + 5 live, все зелёные (в `KalkanCore.slnx`)
 - `ChainValidatorTests` (5): боевой NCA-сертификат → trusted; истёкший → reject;
   чужая иерархия → reject; самоподписанный с поддельным IIN → reject; пустой стор → throw.
 - `TrustEnforcementTests` (2): демонстрация уязвимости (без стора подделка проходит) и фикса.
 - `RevocationTests` (5): Revoked/Good/Unknown(fail-closed)/Unknown(soft)/skip — через фейковый
   `IRevocationChecker`, без сети.
+- `CrlRevocationTests` (11): CRL revoked/good/чужая подпись/истёкший/недоступен/нет CDP/кэш;
+  композит OCSP→CRL; OCSP не шлёт запрос для промежуточного CA.
+- `LivePkiTests` (5, только при `KZ_LIVE_PKI=1`): OCSP SHA-256 и SHA-1, CRL корня (ГОСТ-подпись),
+  CRL НУЦ (20 МБ), полная цепочка с OCSP→CRL. Запуск:
+  `KZ_LIVE_PKI=1 dotnet test --filter LivePkiTests`.
 
 ---
 
 ## Что нужно сделать (вернуться к фичам)
 
-### 🔴 P0 — включить в проде (`appsettings*.json`)
-Без этого вся проверка доверия **выключена** (приём подписи от любого сертификата):
-```json
-"Kalkan": {
-  "Path": "...", "Key": "...",
-  "CaCertsPath": "Infra/Ca_Certs",
-  "OcspResponderUrl": "http://ocsp.pki.gov.kz"
-}
-```
-И на стороне вызова входящих запросов передавать `ValidateOcsp = true`.
+### 🔴 P0 — `ValidateOcsp = true` на стороне вызова
+Конфиг включён (`appsettings.json`), но отзыв проверяется только если вызывающий сервис
+передаёт `ValidateOcsp = true` в запросе верификации входящих сообщений.
 
-### 🔴 P0 — интеграционный тест OCSP против живого `ocsp.pki.gov.kz`
-Файл: `OcspRevocationChecker.cs` (поле `CertIdHashAlgorithm`).
-- Подтвердить hash-алгоритм CertID (SHA-256 vs SHA-1). Если ответчик возвращает `Unknown`
-  на заведомо валидный сертификат — переключить на `CertificateID.HashSha1`.
-- Прогнать на **отозванном** тестовом сертификате → ожидаем `Revoked`, а не `Unknown`
-  (иначе fail-closed отклонит всё подряд, но по неверной причине).
-- Этого нет в CI (нужна сеть) — оформить как ручной/опциональный integration-тест.
+### 🟡 P1 — OCSP на **отозванном** сертификате
+- Живой ответчик проверен только на неотозванном сертификате (`good`). Нужен отозванный
+  тестовый сертификат НУЦ → ожидаем `Revoked`, а не `Unknown`. Логика `Revoked` покрыта
+  офлайн-тестами CRL и фейковым чекером, но не wire-форматом OCSP.
+
+### 🟢 P2 — delta-CRL
+Файл: `CrlRevocationChecker.cs`.
+- Читать `FreshestCRL` / `nca_d_*.crl` поверх базового CRL, чтобы CRL-fallback был актуален
+  до ~6 ч, а не до ~1 сут.
 
 ### 🟡 P1 — GOST-2004 (старые сертификаты)
 Файлы: `CryptCore/Pki/KzGost.cs` (curve-параметры), `CryptCore.Tests`.
@@ -92,12 +115,6 @@
 - Если в проде встречаются GOST-2004 сертификаты: добавить такой `.p12`/`.pem` в фикстуры
   и тест «chains to root». Если подпись CA не сойдётся — задать подлинные параметры через
   `KzGost.RegisterCurve`.
-
-### 🟡 P1 — CRL как fallback к OCSP
-Файлы: новый `CryptCore/Pki/CrlRevocationChecker.cs`, `ChainValidator`.
-- Сейчас при `Unknown` от OCSP (ответчик недоступен) и fail-closed всё отклоняется.
-- Реализовать `IRevocationChecker` поверх CRL (из CDP-расширения сертификата) и
-  композитный чекер «OCSP → при Unknown CRL». ГОСТ-подпись CRL — та же история, что и с OCSP.
 
 ### 🟢 P2 — KeyUsage / EKU
 Файл: `ChainValidator.cs`.
@@ -108,14 +125,18 @@
 ### 🟢 P2 — кэш OCSP-ответов
 Файл: `OcspRevocationChecker.cs`.
 - Каждый Verify с `ValidateOcsp=true` = сетевой запрос. Закэшировать ответ по
-  (issuer, serial) с учётом `nextUpdate` из ответа, чтобы не бить ответчик на каждый запрос.
+  (issuer, serial). Живой ответчик отдаёт только `thisUpdate` без `nextUpdate`, так что
+  TTL придётся задавать конфигом (например, 5–15 мин).
 
 ### 🟢 P2 — nonce в OCSP-запросе
 Файл: `OcspRevocationChecker.cs` (`BuildRequest`).
-- Сейчас nonce не добавляется (защита от replay). Опционально: НУЦ РК ответчик может его
-  не поддерживать — проверить при интеграционном тесте.
+- Сейчас nonce не добавляется (защита от replay). Ответчик НУЦ nonce **поддерживает**
+  (проверено) — можно добавлять и сверять. Несовместимо с кэшем ответов: при кэше
+  nonce имеет смысл только на промахе.
 
 ### ⚪ Прочее
-- `OcspRevocationChecker` использует синхронный `.GetAwaiter().GetResult()` поверх `HttpClient`
-  внутри синхронного `IRevocationChecker.Check`. Если верификация уйдёт в async-путь —
-  пересмотреть на async-интерфейс.
+- `OcspRevocationChecker` и `CrlRevocationChecker` используют синхронный `.GetAwaiter().GetResult()`
+  поверх `HttpClient` внутри синхронного `IRevocationChecker.Check`. Если верификация уйдёт в
+  async-путь — пересмотреть на async-интерфейс.
+- Первая проверка конечного сертификата при недоступном OCSP блокирует запрос на загрузку
+  20 МБ CRL (~9 с). Можно прогревать CRL фоном при старте.

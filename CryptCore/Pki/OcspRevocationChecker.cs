@@ -1,8 +1,6 @@
 using Org.BouncyCastle.Asn1;
 using Org.BouncyCastle.Asn1.Ocsp;
 using Org.BouncyCastle.Asn1.X509;
-using Org.BouncyCastle.Crypto.Parameters;
-using Org.BouncyCastle.Crypto.Signers;
 using Org.BouncyCastle.Ocsp;
 using Org.BouncyCastle.X509;
 using BasicOcspResponseAsn1 = Org.BouncyCastle.Asn1.Ocsp.BasicOcspResponse;
@@ -54,7 +52,12 @@ public sealed class OcspRevocationChecker : IRevocationChecker
     {
         try
         {
-            var url = ResponderUrl(cert) ?? _defaultResponderUrl;
+            var url = ResponderUrl(cert);
+            // NCA issuing CAs carry no AIA OCSP entry and ocsp.pki.gov.kz rejects queries for
+            // them (malformedRequest); their status comes from the root's CRL instead, so don't
+            // waste a round trip on the default responder.
+            if (url == null && cert.GetBasicConstraints() >= 0) return RevocationStatus.Unknown;
+            url ??= _defaultResponderUrl;
             if (string.IsNullOrEmpty(url)) return RevocationStatus.Unknown;
 
             var request = BuildRequest(cert, issuer);
@@ -113,43 +116,14 @@ public sealed class OcspRevocationChecker : IRevocationChecker
         var signerCert = responder ?? issuer;
 
         var asn1 = BasicOcspResponseAsn1.GetInstance(Asn1Object.FromByteArray(basic.GetEncoded()));
-        if (KzGost.IsGostAny(asn1.SignatureAlgorithm.Algorithm))
-            return VerifyGostResponse(asn1, signerCert);
+        var alg = asn1.SignatureAlgorithm.Algorithm;
+        if (KzGost.IsGostAny(alg))
+            return KzGost.VerifyEitherOrientation(
+                signerCert.CertificateStructure.SubjectPublicKeyInfo,
+                asn1.TbsResponseData.GetEncoded(Asn1Encodable.Der), asn1.Signature.GetBytes(), alg);
 
         try { return basic.Verify(signerCert.GetPublicKey()); }
         catch { return false; }
-    }
-
-    private static bool VerifyGostResponse(BasicOcspResponseAsn1 asn1, X509Certificate signerCert)
-    {
-        try
-        {
-            var tbs = asn1.TbsResponseData.GetEncoded(Asn1Encodable.Der);
-            var sig = asn1.Signature.GetBytes();
-            var alg = asn1.SignatureAlgorithm.Algorithm;
-            var pub = KzGost.DecodePublicKey(signerCert.CertificateStructure.SubjectPublicKeyInfo);
-
-            return GostVerify(pub, tbs, sig, alg) || GostVerify(pub, tbs, Reversed(sig), alg);
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
-    private static bool GostVerify(ECPublicKeyParameters pub, byte[] data, byte[] sig, DerObjectIdentifier alg)
-    {
-        try
-        {
-            var signer = new Gost3410DigestSigner(KzGost.CreateSigner(alg), KzGost.CreateDigest(alg));
-            signer.Init(false, pub);
-            signer.BlockUpdate(data, 0, data.Length);
-            return signer.VerifySignature(sig);
-        }
-        catch
-        {
-            return false;
-        }
     }
 
     private static bool IsIssuedBy(X509Certificate subject, X509Certificate issuer)
@@ -157,16 +131,8 @@ public sealed class OcspRevocationChecker : IRevocationChecker
         if (!subject.IssuerDN.Equivalent(issuer.SubjectDN)) return false;
         var sigAlg = subject.CertificateStructure.SignatureAlgorithm.Algorithm;
         if (KzGost.IsGostAny(sigAlg))
-        {
-            try
-            {
-                var pub = KzGost.DecodePublicKey(issuer.CertificateStructure.SubjectPublicKeyInfo);
-                var tbs = subject.GetTbsCertificate();
-                var sig = subject.GetSignature();
-                return GostVerify(pub, tbs, sig, sigAlg) || GostVerify(pub, tbs, Reversed(sig), sigAlg);
-            }
-            catch { return false; }
-        }
+            return KzGost.VerifyEitherOrientation(
+                issuer.CertificateStructure.SubjectPublicKeyInfo, subject.GetTbsCertificate(), subject.GetSignature(), sigAlg);
         try { subject.Verify(issuer.GetPublicKey()); return true; }
         catch { return false; }
     }
@@ -191,12 +157,5 @@ public sealed class OcspRevocationChecker : IRevocationChecker
         }
         catch { /* malformed AIA -> no URL */ }
         return null;
-    }
-
-    private static byte[] Reversed(byte[] b)
-    {
-        var r = (byte[])b.Clone();
-        Array.Reverse(r);
-        return r;
     }
 }

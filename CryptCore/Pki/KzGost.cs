@@ -105,6 +105,41 @@ public static class KzGost
     public static IDsa CreateSigner(DerObjectIdentifier sigOrKeyOid) => new ECGost3410Signer();
 
     /// <summary>
+    /// Verify a GOST signature over <paramref name="data"/> made by the key in
+    /// <paramref name="signerKey"/> — the check behind PKI objects (certificates, CRLs,
+    /// OCSP responses) signed by an NCA CA. KZ stores GOST signature values byte-reversed
+    /// vs BouncyCastle in the XML/CMS profiles, and the convention for PKI objects is not
+    /// guaranteed, so either orientation is accepted; the signature must still verify
+    /// mathematically. Any decode/verify failure is reported as false.
+    /// </summary>
+    public static bool VerifyEitherOrientation(
+        SubjectPublicKeyInfo signerKey, byte[] data, byte[] signature, DerObjectIdentifier sigAlg)
+    {
+        ECPublicKeyParameters pub;
+        try { pub = DecodePublicKey(signerKey); }
+        catch { return false; } // not a GOST key -> cannot have produced a GOST signature
+
+        var reversed = (byte[])signature.Clone();
+        Array.Reverse(reversed);
+        return Verify(pub, data, signature, sigAlg) || Verify(pub, data, reversed, sigAlg);
+    }
+
+    private static bool Verify(ECPublicKeyParameters pub, byte[] data, byte[] sig, DerObjectIdentifier alg)
+    {
+        try
+        {
+            var signer = new Gost3410DigestSigner(CreateSigner(alg), CreateDigest(alg));
+            signer.Init(false, pub);
+            signer.BlockUpdate(data, 0, data.Length);
+            return signer.VerifySignature(sig);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
     /// Decode a GOST public key from a SubjectPublicKeyInfo whose algorithm OID is
     /// one of the KZ arcs (BouncyCastle's PublicKeyFactory does not know them).
     /// The key is an ASN.1 OCTET STRING holding X||Y as little-endian halves.

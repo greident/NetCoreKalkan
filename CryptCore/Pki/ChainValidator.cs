@@ -1,6 +1,3 @@
-using Org.BouncyCastle.Asn1;
-using Org.BouncyCastle.Crypto.Parameters;
-using Org.BouncyCastle.Crypto.Signers;
 using Org.BouncyCastle.OpenSsl;
 using Org.BouncyCastle.X509;
 
@@ -31,8 +28,9 @@ public sealed class ChainValidationResult
 /// so the path is built by DN matching and each link's signature is checked here —
 /// RSA the normal way, GOST through the same primitives as the rest of CryptCore.
 ///
-/// Scope: trust anchoring + signature chaining + validity window. Revocation
-/// (OCSP/CRL) is intentionally out of scope here — see <see cref="ValidateChainOnly"/>.
+/// Scope: trust anchoring + signature chaining + validity window, plus revocation via a
+/// pluggable <see cref="IRevocationChecker"/> (OCSP/CRL) — see <see cref="ValidateChainOnly"/>
+/// for the check without it.
 /// </summary>
 public sealed class ChainValidator
 {
@@ -107,10 +105,10 @@ public sealed class ChainValidator
             var issuer = chain.Path[i + 1];
             var status = _revocation.Check(subject, issuer);
             if (status == RevocationStatus.Revoked)
-                return ChainValidationResult.Fail($"Certificate '{subject.SubjectDN}' is revoked (OCSP).");
+                return ChainValidationResult.Fail($"Certificate '{subject.SubjectDN}' is revoked.");
             if (status == RevocationStatus.Unknown && _failOnUnknownRevocation)
                 return ChainValidationResult.Fail(
-                    $"Revocation status of '{subject.SubjectDN}' could not be determined (OCSP).");
+                    $"Revocation status of '{subject.SubjectDN}' could not be determined.");
         }
         return chain;
     }
@@ -168,37 +166,13 @@ public sealed class ChainValidator
     {
         var sigAlg = subject.CertificateStructure.SignatureAlgorithm.Algorithm;
         if (KzGost.IsGostAny(sigAlg))
-        {
-            ECPublicKeyParameters pub;
-            try { pub = KzGost.DecodePublicKey(issuer.CertificateStructure.SubjectPublicKeyInfo); }
-            catch { return false; } // issuer is not a GOST key -> cannot have signed a GOST cert
-            var tbs = subject.GetTbsCertificate();
-            var sig = subject.GetSignature();
-            // KZ stores GOST signature values byte-reversed vs BouncyCastle in the XML/CMS
-            // profiles; the certificate signature convention is not guaranteed, so accept
-            // either orientation. The signature must still verify mathematically.
-            return GostVerify(pub, tbs, sig, sigAlg) || GostVerify(pub, tbs, Reversed(sig), sigAlg);
-        }
+            return KzGost.VerifyEitherOrientation(
+                issuer.CertificateStructure.SubjectPublicKeyInfo, subject.GetTbsCertificate(), subject.GetSignature(), sigAlg);
 
         try
         {
             subject.Verify(issuer.GetPublicKey()); // RSA (and anything BouncyCastle knows); throws on mismatch
             return true;
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
-    private static bool GostVerify(ECPublicKeyParameters pub, byte[] data, byte[] sig, DerObjectIdentifier alg)
-    {
-        try
-        {
-            var signer = new Gost3410DigestSigner(KzGost.CreateSigner(alg), KzGost.CreateDigest(alg));
-            signer.Init(false, pub);
-            signer.BlockUpdate(data, 0, data.Length);
-            return signer.VerifySignature(sig);
         }
         catch
         {
@@ -218,13 +192,6 @@ public sealed class ChainValidator
 
     private static bool IsTimeValid(X509Certificate c, DateTime nowUtc)
         => nowUtc >= c.NotBefore.ToUniversalTime() && nowUtc <= c.NotAfter.ToUniversalTime();
-
-    private static byte[] Reversed(byte[] b)
-    {
-        var r = (byte[])b.Clone();
-        Array.Reverse(r);
-        return r;
-    }
 
     private static IEnumerable<X509Certificate> ReadPemCerts(string path)
     {
