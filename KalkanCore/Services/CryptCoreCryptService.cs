@@ -19,6 +19,7 @@ public class CryptCoreCryptService : ICryptService
 {
     private readonly ILogger<CryptCoreCryptService> _logger;
     private readonly KzCryptoService _crypto;
+    private readonly bool _requireRevocation;
 
     // Shared client for OCSP requests; bounded timeout so verification never blocks long.
     private static readonly HttpClient OcspHttp = new() { Timeout = TimeSpan.FromSeconds(10) };
@@ -34,15 +35,18 @@ public class CryptCoreCryptService : ICryptService
         ChainValidator? trust = null;
         if (!string.IsNullOrWhiteSpace(opt.CaCertsPath) && Directory.Exists(opt.CaCertsPath))
         {
-            // Revocation is only consulted when the caller passes ValidateOcsp=true (see Verify).
-            // OCSP first; CRL covers the issuing CAs (no OCSP responder) and OCSP outages.
+            // Revocation is consulted when the caller passes ValidateOcsp=true or the server
+            // enforces it (RequireRevocationCheck, see Revocation). OCSP first; CRL covers the
+            // issuing CAs (no OCSP responder) and OCSP outages.
             var revocation = new CompositeRevocationChecker(
                 new OcspRevocationChecker(OcspHttp, opt.OcspResponderUrl),
                 new CrlRevocationChecker(CrlHttp));
             trust = ChainValidator.FromPemDirectory(opt.CaCertsPath, revocation);
+            _requireRevocation = opt.RequireRevocationCheck;
             _logger.LogInformation(
-                "Загружен trust-store НУЦ РК из {Path}; проверка цепочки включена, отзыв: OCSP ({Url}) → CRL.",
-                opt.CaCertsPath, opt.OcspResponderUrl ?? "из AIA сертификата");
+                "Загружен trust-store НУЦ РК из {Path}; проверка цепочки включена, отзыв: OCSP ({Url}) → CRL, {Mode}.",
+                opt.CaCertsPath, opt.OcspResponderUrl ?? "из AIA сертификата",
+                _requireRevocation ? "всегда" : "по флагу ValidateOcsp запроса");
         }
         else
         {
@@ -70,22 +74,25 @@ public class CryptCoreCryptService : ICryptService
     public VerifyResultDto Verify(VerifyDto dto)
     {
         var xml = HttpUtility.HtmlDecode(dto.Xml);
-        return Map(SafeVerify("XML", () => _crypto.VerifyXml(xml, dto.ValidateOcsp)));
+        return Map(SafeVerify("XML", () => _crypto.VerifyXml(xml, Revocation(dto.ValidateOcsp))));
     }
 
     public VerifyResultDto VerifyBase64(VerifyBase64Dto dto)
     {
         var xml = Encoding.UTF8.GetString(dto.XmlData);
-        return Map(SafeVerify("XML", () => _crypto.VerifyXml(xml, dto.ValidateOcsp)));
+        return Map(SafeVerify("XML", () => _crypto.VerifyXml(xml, Revocation(dto.ValidateOcsp))));
     }
 
     public VerifyResultDto VerifyWsse(VerifyWsseDto dto)
-        => Map(SafeVerify("WSSE", () => _crypto.VerifyWsse(dto.Envelope, dto.ValidateOcsp)));
+        => Map(SafeVerify("WSSE", () => _crypto.VerifyWsse(dto.Envelope, Revocation(dto.ValidateOcsp))));
 
     public byte[] SignCms(SignCmsDto dto) => _crypto.SignCms(dto.Data, dto.Detached);
 
     public VerifyResultDto VerifyCms(VerifyCmsDto dto)
-        => Map(SafeVerify("CMS", () => _crypto.VerifyCms(dto.Cms, dto.Data, dto.ValidateOcsp)));
+        => Map(SafeVerify("CMS", () => _crypto.VerifyCms(dto.Cms, dto.Data, Revocation(dto.ValidateOcsp))));
+
+    // The request's ValidateOcsp flag can turn revocation on, never off when the server requires it.
+    private bool Revocation(bool requested) => requested || _requireRevocation;
 
     private VerifyResult SafeVerify(string format, Func<VerifyResult> verify)
     {

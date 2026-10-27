@@ -127,11 +127,30 @@ public sealed class ChainValidator
         pool.AddRange(_intermediates);
         pool.AddRange(_anchors);
 
+        if (!CanSign(leaf))
+            return ChainValidationResult.Fail(
+                $"Certificate '{leaf.SubjectDN}' key usage permits neither digitalSignature nor nonRepudiation.");
+
         var path = new List<X509Certificate> { leaf };
         var current = leaf;
 
         for (var depth = 0; depth < MaxDepth; depth++)
         {
+            // Every certificate above the leaf vouches for the one below it, so it must be a
+            // CA allowed to sign certificates. Without this, anyone holding an ordinary NCA
+            // certificate could issue one with someone else's IIN/BIN and ship both in a CMS.
+            if (depth > 0)
+            {
+                if (!CanIssue(current))
+                    return ChainValidationResult.Fail(
+                        $"Certificate '{current.SubjectDN}' is not a CA (basicConstraints/keyUsage) " +
+                        "and cannot issue certificates.");
+                // CAs below this one in the path, not counting the leaf.
+                if (depth - 1 > current.GetBasicConstraints())
+                    return ChainValidationResult.Fail(
+                        $"Certificate '{current.SubjectDN}' path length constraint exceeded.");
+            }
+
             if (!IsTimeValid(current, now))
                 return ChainValidationResult.Fail(
                     $"Certificate '{current.SubjectDN}' is outside its validity window " +
@@ -189,6 +208,16 @@ public sealed class ChainValidator
     }
 
     private static bool IsSelfIssued(X509Certificate c) => c.IssuerDN.Equivalent(c.SubjectDN);
+
+    // KeyUsage bit positions (RFC 5280 §4.2.1.3); a missing extension places no restriction.
+    private const int DigitalSignature = 0, NonRepudiation = 1, KeyCertSign = 5;
+
+    /// <summary>basicConstraints cA=TRUE and, if keyUsage is present, keyCertSign.</summary>
+    private static bool CanIssue(X509Certificate c)
+        => c.GetBasicConstraints() >= 0 && (c.GetKeyUsage() is not { } ku || ku[KeyCertSign]);
+
+    private static bool CanSign(X509Certificate c)
+        => c.GetKeyUsage() is not { } ku || ku[DigitalSignature] || ku[NonRepudiation];
 
     private static bool IsTimeValid(X509Certificate c, DateTime nowUtc)
         => nowUtc >= c.NotBefore.ToUniversalTime() && nowUtc <= c.NotAfter.ToUniversalTime();

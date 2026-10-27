@@ -30,6 +30,15 @@ public static class Fixtures
     /// <summary>The МАМЕТОВ certificate was valid Oct 2024 .. Oct 2025; pick an instant inside that.</summary>
     public static readonly DateTime MametovValidInstant = new(2025, 1, 15, 0, 0, 0, DateTimeKind.Utc);
 
+    /// <summary>End-entity "БЕКБАУОВ БАГЛАН" (IIN830116301379), GOST-2004, issued by the 2018 NCA GOST CA.</summary>
+    public static string BekbauovGostCertPath => Path.Combine(PemsDir, "certificateGost.pem");
+
+    /// <summary>Same person, RSA certificate issued by the 2018 NCA RSA CA.</summary>
+    public static string BekbauovRsaCertPath => Path.Combine(PemsDir, "certificateRsa.pem");
+
+    /// <summary>Both БЕКБАУОВ certificates were valid Feb 2024 .. Feb 2025, as were their CAs.</summary>
+    public static readonly DateTime BekbauovValidInstant = new(2024, 6, 1, 0, 0, 0, DateTimeKind.Utc);
+
     public static X509Certificate LoadCert(string path)
     {
         using var s = File.OpenRead(path);

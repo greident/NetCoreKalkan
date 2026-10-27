@@ -28,4 +28,11 @@ public class KalkanOption
     /// carries no AIA OCSP entry. Only consulted for requests with ValidateOcsp=true.
     /// </summary>
     public string? OcspResponderUrl { get; init; }
+
+    /// <summary>
+    /// When true, every verification checks revocation (OCSP → CRL) regardless of the
+    /// request's ValidateOcsp flag, so a caller that omits it cannot skip the check.
+    /// Only takes effect together with <see cref="CaCertsPath"/>.
+    /// </summary>
+    public bool RequireRevocationCheck { get; init; }
 }

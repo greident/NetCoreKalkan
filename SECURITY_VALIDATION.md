@@ -20,8 +20,22 @@
 - Самоподписанные сертификаты из стора → trust anchors; остальные → промежуточные.
 - `Validate(...)` = цепочка + срок + отзыв; `ValidateChainOnly(...)` = без отзыва.
 - Fail-closed: `failOnUnknownRevocation = true` по умолчанию.
-- ⚠️ Curve-параметры GOST-2015 подтверждены тестом на боевой иерархии. **GOST-2004 не проверен**
-  (нет фикстуры) — см. ниже.
+- **Ограничения CA** (RFC 5280): каждый издатель в пути обязан иметь `basicConstraints cA=TRUE`
+  и (если есть keyUsage) `keyCertSign`; соблюдается `pathLenConstraint`. У подписанта keyUsage
+  (если есть) должен содержать `digitalSignature` или `nonRepudiation`.
+  Закрывает атаку через CMS: владелец любого обычного сертификата НУЦ выпускал своим ключом
+  сертификат на чужой ИИН/БИН, вкладывал оба в CMS — цепочка «подделка → свой серт НУЦ →
+  NCA → root» сходилась по подписям и принималась как доверенная. XML/WSSE не были
+  уязвимы (там издатели берутся только из trust-store).
+- Параметры ГОСТ подтверждены тестами на боевых иерархиях: GOST-2015 (2022) и **GOST-2004**
+  (2015/2018, сертификат БЕКБАУОВ) + RSA (2018).
+
+### `CryptCore/Pki/KzGost.cs` — ✅ ГОСТ-2004 исправлен
+- Хэш ГОСТ 34.311-95 был с S-box BouncyCastle по умолчанию (CryptoPro `D-A`); НУЦ использует
+  **тестовый набор `D-TEST`** (параметр хэша `1.2.398.3.10.1.3.1.1.0`). С `D-A` не сходилась ни
+  одна ГОСТ-2004 подпись НУЦ — проверка цепочки отклоняла все ГОСТ-2004 сертификаты, а подписи
+  ГОСТ-2004 ключами (XML/CMS/WSSE) и `DigestValue` `gost34311` были несовместимы с Kalkan.
+  Кривая (CryptoPro-A) и порядок байт подписи были верными.
 
 ### `CryptCore/Pki/IRevocationChecker.cs` — ✅ абстракция отзыва
 - Enum `RevocationStatus { Good, Revoked, Unknown }` + интерфейс. Развязывает `ChainValidator`
@@ -71,56 +85,52 @@
   CRL: 60с) + `ChainValidator` из `CaCertsPath`. При отсутствии пути — **WARNING**, что
   проверка цепочки отключена.
 - `VerifyDto.ValidateOcsp` → `checkRevocation` через весь стек (флаг больше не игнорируется;
-  несмотря на имя, включает и CRL).
+  несмотря на имя, включает и CRL). При `RequireRevocationCheck = true` отзыв проверяется
+  всегда — флаг запроса может только включить проверку, но не выключить.
 - HTTP API: `crypt/verify/xml`, `crypt/verify/xml/base64`, `crypt/verify/wsse`,
   `crypt/cms/sign`, `crypt/cms/verify`; ответ проверки содержит `Error` с причиной отказа.
 
 ### `KalkanCore/BaseOptions/BaseOptions.cs` + `appsettings.json` — ✅ конфиг
 - `KalkanOption.CaCertsPath` — папка PEM-корней; в `appsettings.json` = `/app/Infra/Ca_Certs`.
 - `KalkanOption.OcspResponderUrl` — fallback-URL ответчика; = `http://ocsp.pki.gov.kz`.
+- `KalkanOption.RequireRevocationCheck` — отзыв проверяется всегда; = `true`.
 
-### `CryptCore.Tests/` — ✅ 23 офлайн-теста + 5 live, все зелёные (в `KalkanCore.slnx`)
-- `ChainValidatorTests` (5): боевой NCA-сертификат → trusted; истёкший → reject;
-  чужая иерархия → reject; самоподписанный с поддельным IIN → reject; пустой стор → throw.
+### `CryptCore.Tests/` — ✅ 32 офлайн-теста + 7 live, все зелёные (в `KalkanCore.slnx`)
+- `ChainValidatorTests` (7): боевой NCA-сертификат GOST-2015, GOST-2004 и RSA → trusted;
+  истёкший → reject; чужая иерархия → reject; самоподписанный с поддельным IIN → reject;
+  пустой стор → throw.
+- `CaConstraintTests` (7): серт, выпущенный не-CA → reject (и end-to-end через CMS с вложенным
+  издателем); CA без keyCertSign → reject; pathLen; ключ без digitalSignature/nonRepudiation → reject.
 - `TrustEnforcementTests` (2): демонстрация уязвимости (без стора подделка проходит) и фикса.
 - `RevocationTests` (5): Revoked/Good/Unknown(fail-closed)/Unknown(soft)/skip — через фейковый
   `IRevocationChecker`, без сети.
 - `CrlRevocationTests` (11): CRL revoked/good/чужая подпись/истёкший/недоступен/нет CDP/кэш;
   композит OCSP→CRL; OCSP не шлёт запрос для промежуточного CA.
-- `LivePkiTests` (5, только при `KZ_LIVE_PKI=1`): OCSP SHA-256 и SHA-1, CRL корня (ГОСТ-подпись),
-  CRL НУЦ (20 МБ), полная цепочка с OCSP→CRL. Запуск:
+- `LivePkiTests` (7, только при `KZ_LIVE_PKI=1`): OCSP SHA-256 и SHA-1, CRL корня (ГОСТ-подпись),
+  CRL НУЦ (20 МБ), **отозванный серийник из CRL НУЦ → `Revoked` по OCSP и по CRL**,
+  полная цепочка с OCSP→CRL. Запуск:
   `KZ_LIVE_PKI=1 dotnet test --filter LivePkiTests`.
 
 ---
 
 ## Что нужно сделать (вернуться к фичам)
 
-### 🔴 P0 — `ValidateOcsp = true` на стороне вызова
-Конфиг включён (`appsettings.json`), но отзыв проверяется только если вызывающий сервис
-передаёт `ValidateOcsp = true` в запросе верификации входящих сообщений.
-
-### 🟡 P1 — OCSP на **отозванном** сертификате
-- Живой ответчик проверен только на неотозванном сертификате (`good`). Нужен отозванный
-  тестовый сертификат НУЦ → ожидаем `Revoked`, а не `Unknown`. Логика `Revoked` покрыта
-  офлайн-тестами CRL и фейковым чекером, но не wire-форматом OCSP.
+### 🟡 P1 — подпись ГОСТ-2004 ключом против Kalkan
+- После исправления S-box проверка ГОСТ-2004 подтверждена на боевых сертификатах, но
+  **подпись** ГОСТ-2004 ключом (XML/CMS/WSSE) не проверена: в фикстурах нет приватного
+  ключа ГОСТ-2004 (`gost_private_key.pem` пустой — только заголовок). Нужен `.p12` и сверка
+  с Kalkan/SmartBridge. (`test_CMS_GOST.txt` — не CMS, а тот же сертификат БЕКБАУОВ.)
 
 ### 🟢 P2 — delta-CRL
 Файл: `CrlRevocationChecker.cs`.
 - Читать `FreshestCRL` / `nca_d_*.crl` поверх базового CRL, чтобы CRL-fallback был актуален
   до ~6 ч, а не до ~1 сут.
 
-### 🟡 P1 — GOST-2004 (старые сертификаты)
-Файлы: `CryptCore/Pki/KzGost.cs` (curve-параметры), `CryptCore.Tests`.
-- Curve-параметры GOST-2004 помечены как «best known» и **не проверены тестом** (нет фикстуры).
-- Если в проде встречаются GOST-2004 сертификаты: добавить такой `.p12`/`.pem` в фикстуры
-  и тест «chains to root». Если подпись CA не сойдётся — задать подлинные параметры через
-  `KzGost.RegisterCurve`.
-
-### 🟢 P2 — KeyUsage / EKU
+### 🟢 P2 — EKU / политика сертификата
 Файл: `ChainValidator.cs`.
-- Не проверяется назначение ключа (digitalSignature/nonRepudiation) и EKU.
-- Низкий приоритет: НУЦ РК выдаёт сертификаты с корректным usage, но для строгого
-  соответствия стоит добавить проверку.
+- keyUsage проверяется, EKU — нет. НУЦ кладёт в EKU свои OID (`1.2.398.3.3.4.*`: физлицо,
+  сотрудник организации, первый руководитель…). Если сервису важно, *кто* подписал (например,
+  только первый руководитель юрлица), это бизнес-правило поверх `Signers`, а не проверка цепочки.
 
 ### 🟢 P2 — кэш OCSP-ответов
 Файл: `OcspRevocationChecker.cs`.

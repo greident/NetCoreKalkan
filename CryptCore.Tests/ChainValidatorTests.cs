@@ -27,6 +27,32 @@ public class ChainValidatorTests
         Assert.Equal(3, result.Path.Count);
     }
 
+    // Canary for the GOST-2004 (34.310-2004) curve mapping in KzGost: the 2015/2018
+    // hierarchy and the БЕКБАУОВ leaf are all GOST-2004 signed, so both links only verify
+    // if the CryptoPro-A parameter set really is the KZ 256-bit curve.
+    [Fact]
+    public void TrustsRealNcaCert_Gost2004Hierarchy()
+    {
+        var validator = Fixtures.ProductionTrust();
+
+        var result = validator.ValidateChainOnly(Fixtures.LoadCert(Fixtures.BekbauovGostCertPath), atUtc: Fixtures.BekbauovValidInstant);
+
+        Assert.True(result.Trusted, result.Error);
+        // leaf -> intermediate (NCA GOST) -> root (GOST)
+        Assert.Equal(3, result.Path.Count);
+    }
+
+    [Fact]
+    public void TrustsRealNcaCert_RsaHierarchy()
+    {
+        var validator = Fixtures.ProductionTrust();
+
+        var result = validator.ValidateChainOnly(Fixtures.LoadCert(Fixtures.BekbauovRsaCertPath), atUtc: Fixtures.BekbauovValidInstant);
+
+        Assert.True(result.Trusted, result.Error);
+        Assert.Equal(3, result.Path.Count);
+    }
+
     [Fact]
     public void RejectsRealNcaCert_WhenExpired()
     {
