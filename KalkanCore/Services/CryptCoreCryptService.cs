@@ -1,5 +1,4 @@
 using System.Text;
-using System.Web;
 using CryptCore;
 using CryptCore.Models;
 using CryptCore.Pki;
@@ -69,12 +68,14 @@ public class CryptCoreCryptService : ICryptService
         _tsa = new TspClient(TspHttp, opt.TspUrl);
     }
 
+    // XML is taken exactly as sent (raw, as NCANode does). It used to be HTML-decoded first,
+    // which turned &amp;/&lt; in the data into broken XML and escaped text into real elements.
     public string SignXml(string messageBody)
-        => _crypto.SignXml(HttpUtility.HtmlDecode(messageBody));
+        => _crypto.SignXml(messageBody);
 
     public string SignXml(SignXmlDto dto)
         // Each signer appends its ds:Signature over the document as signed so far.
-        => Keys(dto.Signers).Aggregate(HttpUtility.HtmlDecode(dto.Xml), (xml, key) => XmlDsigService.Sign(key, xml));
+        => Keys(dto.Signers).Aggregate(dto.Xml, (xml, key) => XmlDsigService.Sign(key, xml));
 
     public string SignWsse(SignWsseDto dto) => WsseService.Sign(Key(dto.Key), dto.MessageBody, dto.MessageId);
 
@@ -113,10 +114,7 @@ public class CryptCoreCryptService : ICryptService
         => signers is { Count: > 0 } ? signers.Select(Key).ToList() : new[] { _key };
 
     public VerifyResultDto Verify(VerifyDto dto)
-    {
-        var xml = HttpUtility.HtmlDecode(dto.Xml);
-        return Map(SafeVerify("XML", () => _crypto.VerifyXml(xml, Revocation(dto.ValidateOcsp))));
-    }
+        => Map(SafeVerify("XML", () => _crypto.VerifyXml(dto.Xml, Revocation(dto.ValidateOcsp))));
 
     public VerifyResultDto VerifyBase64(VerifyBase64Dto dto)
     {
