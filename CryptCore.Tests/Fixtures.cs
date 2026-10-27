@@ -22,6 +22,16 @@ public static class Fixtures
     public static string InfraDir { get; } = LocateInfra();
 
     public static string CaCertsDir => Path.Combine(InfraDir, "Ca_Certs");
+
+    /// <summary>CryptCore.Tests/TestData: real NCA artefacts captured for interop tests.</summary>
+    public static string TestDataDir => Path.Combine(InfraDir, "..", "..", "CryptCore.Tests", "TestData");
+
+    /// <summary>
+    /// Timestamp tokens issued by tsp.pki.gov.kz on 2026-10-27 — genuine Kalkan-produced CMS
+    /// SignedData: GOST-2015 (policy 1.2.398.3.3.2.6.4) and RSA (1.2.398.3.3.2.6.2).
+    /// </summary>
+    public static byte[] NcaTstGost2015 => File.ReadAllBytes(Path.Combine(TestDataDir, "nca_tst_gost2015.der"));
+    public static byte[] NcaTstRsa2022 => File.ReadAllBytes(Path.Combine(TestDataDir, "nca_tst_rsa2022.der"));
     public static string PemsDir => Path.Combine(InfraDir, "Certs", "Pems");
 
     /// <summary>End-entity test certificate "МАМЕТОВ ДАУЛЕТ" (IIN850717351069), GOST-2015.</summary>

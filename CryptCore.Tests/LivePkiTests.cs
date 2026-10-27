@@ -145,6 +145,44 @@ public class LivePkiTests
         Assert.Equal(RevocationStatus.Revoked, crl.Check(StandIn(RevokedSerial.Value), NcaGost2022()));
     }
 
+    // ---- TSA ---------------------------------------------------------------
+
+    [LiveFact]
+    public void Tsp_GostToken_ChainsToNcaRoot()
+    {
+        // Only the key *type* drives the hash/policy choice, so a GOST-2015 certificate
+        // stands in for a GOST signer (no GOST private key is available).
+        var gostSigner = new CryptCore.Pki.SigningKey
+        {
+            Certificate = Mametov(),
+            PrivateKey = Fixtures.ForgedSelfSignedKey("000000000000").PrivateKey,
+            Chain = new[] { Mametov() },
+        };
+
+        var token = new CryptCore.Signing.TspClient(Http).Timestamp(Fixtures.Utf8("hello"), gostSigner);
+
+        var result = CryptCore.Signing.CmsService.Verify(token, trust: Fixtures.ProductionTrust(), checkRevocation: false);
+        Assert.True(result.Valid, result.Error);
+        Assert.Equal("GOST-2015", Assert.Single(result.Signers).KeyAlgorithm);
+    }
+
+    [LiveFact]
+    public void Tsp_RsaSignature_TimestampedByNca_IsTrusted()
+    {
+        var key = Fixtures.ForgedSelfSignedKey("111111111111");
+        var cms = new KzCryptoService(key).SignCms(Fixtures.Utf8("hello"), tsa: new CryptCore.Signing.TspClient(Http));
+
+        // The signer is self-signed, so the CMS is rejected — but only after the NCA
+        // timestamp (RSA TSA under NCA RSA 2022) has been verified and trusted.
+        var trusted = new KzCryptoService(key, Fixtures.ProductionTrust()).VerifyCms(cms, checkRevocation: false);
+        Assert.False(trusted.Valid);
+        Assert.Contains("untrusted self-signed", trusted.Error);
+
+        var plain = new KzCryptoService(key).VerifyCms(cms);
+        Assert.True(plain.Valid, plain.Error);
+        Assert.InRange(Assert.Single(plain.Signers).TimestampUtc!.Value, DateTime.UtcNow.AddMinutes(-5), DateTime.UtcNow.AddMinutes(5));
+    }
+
     [LiveFact]
     public void FullChain_WithOcspThenCrl_IsTrusted()
     {

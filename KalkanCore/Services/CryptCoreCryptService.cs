@@ -3,6 +3,7 @@ using System.Web;
 using CryptCore;
 using CryptCore.Models;
 using CryptCore.Pki;
+using CryptCore.Signing;
 using KalkanCore.BaseOptions;
 using KalkanCore.DTO.Kalkan;
 using Microsoft.Extensions.Options;
@@ -19,7 +20,12 @@ public class CryptCoreCryptService : ICryptService
 {
     private readonly ILogger<CryptCoreCryptService> _logger;
     private readonly KzCryptoService _crypto;
+    private readonly SigningKey _key;
+    private readonly TspClient _tsa;
     private readonly bool _requireRevocation;
+
+    // TSA requests are small and quick; keep the wait bounded.
+    private static readonly HttpClient TspHttp = new() { Timeout = TimeSpan.FromSeconds(20) };
 
     // Shared client for OCSP requests; bounded timeout so verification never blocks long.
     private static readonly HttpClient OcspHttp = new() { Timeout = TimeSpan.FromSeconds(10) };
@@ -58,21 +64,53 @@ public class CryptCoreCryptService : ICryptService
                 "Подпись будет приниматься от любого (в т.ч. самоподписанного) сертификата.");
         }
 
-        _crypto = KzCryptoService.FromPkcs12(opt.Path, opt.Key, trust);
+        _key = Pkcs12Loader.Load(opt.Path, opt.Key);
+        _crypto = new KzCryptoService(_key, trust);
+        _tsa = new TspClient(TspHttp, opt.TspUrl);
     }
 
     public string SignXml(string messageBody)
         => _crypto.SignXml(HttpUtility.HtmlDecode(messageBody));
 
-    public string SignWsse(SignWsseDto dto) => SignWsse(dto.MessageBody, dto.MessageId);
+    public string SignXml(SignXmlDto dto)
+        // Each signer appends its ds:Signature over the document as signed so far.
+        => Keys(dto.Signers).Aggregate(HttpUtility.HtmlDecode(dto.Xml), (xml, key) => XmlDsigService.Sign(key, xml));
+
+    public string SignWsse(SignWsseDto dto) => WsseService.Sign(Key(dto.Key), dto.MessageBody, dto.MessageId);
 
     public string SignWsse(string messageBody, string messageId)
         => _crypto.SignWsse(messageBody, messageId);
 
-    public string SignWsseRaw(SignWsseRawDto dto) => SignWsseRaw(dto.Envelope, dto.MessageId);
+    public string SignWsseRaw(SignWsseRawDto dto) => WsseService.SignRaw(Key(dto.Key), dto.Envelope, dto.MessageId);
 
     public string SignWsseRaw(string envelope, string messageId)
         => _crypto.SignWsseRaw(envelope, messageId);
+
+    public byte[] SignCms(SignCmsDto dto)
+        => CmsService.Sign(Keys(dto.Signers), dto.Data, dto.Detached, dto.WithTsp ? _tsa : null);
+
+    public byte[] AddCmsSigners(AddCmsSignersDto dto)
+        => CmsService.AddSigners(dto.Cms, Keys(dto.Signers), dto.Data, dto.WithTsp ? _tsa : null);
+
+    public List<string> Pkcs12Aliases(Pkcs12Dto dto)
+        => Pkcs12Loader.List(dto.P12, dto.Password).Select(e => e.Alias).ToList();
+
+    public List<Pkcs12KeyInfoDto> Pkcs12Info(Pkcs12Dto dto)
+        => Pkcs12Loader.List(dto.P12, dto.Password)
+            .Select(e =>
+            {
+                var info = Map(SafeVerify("PKCS12", () =>
+                    _crypto.VerifyCertificate(e.Certificate.GetEncoded(), Revocation(dto.ValidateOcsp))), new Pkcs12KeyInfoDto());
+                info.Alias = e.Alias;
+                return info;
+            })
+            .ToList();
+
+    /// <summary>The request's key if it carries one, else the service key.</summary>
+    private SigningKey Key(SignerKeyDto? key) => key == null ? _key : Pkcs12Loader.Load(key.P12, key.Password, key.Alias);
+
+    private IReadOnlyList<SigningKey> Keys(List<SignerKeyDto>? signers)
+        => signers is { Count: > 0 } ? signers.Select(Key).ToList() : new[] { _key };
 
     public VerifyResultDto Verify(VerifyDto dto)
     {
@@ -88,8 +126,6 @@ public class CryptCoreCryptService : ICryptService
 
     public VerifyResultDto VerifyWsse(VerifyWsseDto dto)
         => Map(SafeVerify("WSSE", () => _crypto.VerifyWsse(dto.Envelope, Revocation(dto.ValidateOcsp))));
-
-    public byte[] SignCms(SignCmsDto dto) => _crypto.SignCms(dto.Data, dto.Detached);
 
     public VerifyResultDto VerifyCms(VerifyCmsDto dto)
         => Map(SafeVerify("CMS", () => _crypto.VerifyCms(dto.Cms, dto.Data, Revocation(dto.ValidateOcsp))));
@@ -141,6 +177,7 @@ public class CryptCoreCryptService : ICryptService
         SerialNumber = signer.SerialNumber,
         Issuer = signer.Issuer,
         KeyAlgorithm = signer.KeyAlgorithm,
+        TimestampUtc = signer.TimestampUtc,
         SubjectInfo = new CertificationSubjectInfoDto
         {
             Iin = signer.SubjectInfo.Iin,

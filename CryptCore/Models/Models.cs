@@ -25,6 +25,12 @@ public class CertificateInfo
     /// <summary>Algorithm family: "RSA", "GOST-2004" or "GOST-2015".</summary>
     public string KeyAlgorithm { get; set; } = "";
     public CertSubjectInfo SubjectInfo { get; set; } = new();
+
+    /// <summary>
+    /// Signing time proven by a verified RFC 3161 timestamp on this signer's signature
+    /// (CMS only); null when the signature carries none.
+    /// </summary>
+    public DateTime? TimestampUtc { get; set; }
 }
 
 /// <summary>Result of a signature verification.</summary>

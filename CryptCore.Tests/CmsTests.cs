@@ -50,6 +50,29 @@ public class CmsTests
         Assert.Contains("content", result.Error);
     }
 
+    // ---- interop with Kalkan-produced CMS -----------------------------------
+    // NCA timestamp tokens are CMS SignedData signed by the NCA's own Kalkan stack, so they
+    // pin our byte conventions to the real thing (a self round trip cannot: it would pass
+    // with any convention as long as sign and verify agree).
+
+    [Fact]
+    public void NcaGostCms_Verifies()
+    {
+        var result = CryptCore.Signing.CmsService.Verify(Fixtures.NcaTstGost2015, checkRevocation: false);
+
+        Assert.True(result.Valid, result.Error);
+        Assert.Equal("GOST-2015", Assert.Single(result.Signers).KeyAlgorithm);
+    }
+
+    [Fact]
+    public void NcaRsaCms_Verifies()
+    {
+        var result = CryptCore.Signing.CmsService.Verify(Fixtures.NcaTstRsa2022, checkRevocation: false);
+
+        Assert.True(result.Valid, result.Error);
+        Assert.Equal("RSA", Assert.Single(result.Signers).KeyAlgorithm);
+    }
+
     [Fact]
     public void Extract_Attached_ReturnsContent()
     {

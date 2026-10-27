@@ -47,46 +47,33 @@ public static class XmlDsigService
         return ToXmlString(doc);
     }
 
+    /// <summary>
+    /// Verify every signature on the document. Signing an already signed document appends
+    /// another ds:Signature to the root whose digest covers the earlier ones (NCANode/Kalkan
+    /// convention), so signatures are checked last to first, each against the document with
+    /// itself and every later signature removed. All must be valid; <see cref="VerifyResult.Signers"/>
+    /// lists the signers in signing order.
+    /// </summary>
     public static VerifyResult Verify(string xml, ChainValidator? trust = null, bool checkRevocation = true)
     {
-        var result = new VerifyResult();
+        var result = new VerifyResult { Valid = true };
         try
         {
-            var doc = Load(xml);
-            var sig = doc.GetElementsByTagName("Signature", Ds).Cast<XmlElement>().FirstOrDefault();
-            if (sig == null) { result.Valid = false; result.Error = "No ds:Signature element."; return result; }
+            var working = Load(xml);
+            var signatures = working.DocumentElement!.ChildNodes.OfType<XmlElement>()
+                .Where(e => e.LocalName == "Signature" && e.NamespaceURI == Ds).ToList();
+            // A signature elsewhere than at the root: verify it alone, as before.
+            if (signatures.Count == 0 &&
+                working.GetElementsByTagName("Signature", Ds).Cast<XmlElement>().FirstOrDefault() is { } nested)
+                signatures.Add(nested);
+            if (signatures.Count == 0) { result.Valid = false; result.Error = "No ds:Signature element."; return result; }
 
-            var signedInfo = (XmlElement)sig.GetElementsByTagName("SignedInfo", Ds)[0]!;
-            var sigValue = Convert.FromBase64String(Text(sig, "SignatureValue"));
-            var declaredDigest = Text(sig, "DigestValue");
-            var certB64 = Text(sig, "X509Certificate");
-            var cert = new X509CertificateParser().ReadCertificate(Convert.FromBase64String(certB64));
-            var keyOid = cert.CertificateStructure.SubjectPublicKeyInfo.Algorithm.Algorithm;
-            result.Signers.Add(CertificateInfoParser.Parse(cert));
-
-            // 1. Reference digest: remove the signature (enveloped transform) and canonicalise.
-            var working = Load(ToXmlString(doc));
-            var sigInWorking = working.GetElementsByTagName("Signature", Ds).Cast<XmlElement>().First();
-            sigInWorking.ParentNode!.RemoveChild(sigInWorking);
-            var actualDigest = Convert.ToBase64String(Digest(keyOid, Canonicalizer.Inclusive(working, withComments: true)));
-            if (actualDigest != declaredDigest)
+            for (var i = signatures.Count - 1; i >= 0; i--)
             {
+                var error = VerifyOne(working, signatures[i], trust, checkRevocation, result);
+                if (error == null) continue;
                 result.Valid = false;
-                result.Error = "Reference digest mismatch.";
-                return result;
-            }
-
-            // 2. Signature over the canonicalised SignedInfo (GOST value is byte-reversed).
-            if (KzGost.IsGost(keyOid)) Array.Reverse(sigValue);
-            result.Valid = KzSignatures.Verify(cert, Canonicalizer.InclusiveInContext(signedInfo), sigValue);
-            if (!result.Valid) { result.Error = "SignedInfo signature invalid."; return result; }
-
-            // 3. Trust: the signature is cryptographically sound, but only trust it if
-            // the signer certificate chains to a configured NCA root and is in date.
-            if (trust != null)
-            {
-                var chain = trust.Validate(cert, checkRevocation: checkRevocation);
-                if (!chain.Trusted) { result.Valid = false; result.Error = chain.Error; }
+                result.Error ??= signatures.Count == 1 ? error : $"Signature #{i + 1}: {error}";
             }
         }
         catch (Exception e)
@@ -95,6 +82,37 @@ public static class XmlDsigService
             result.Error = e.Message;
         }
         return result;
+    }
+
+    /// <summary>Verify one signature and detach it from <paramref name="working"/>; null when valid.</summary>
+    private static string? VerifyOne(XmlDocument working, XmlElement sig, ChainValidator? trust, bool checkRevocation, VerifyResult result)
+    {
+        var signedInfo = (XmlElement)sig.GetElementsByTagName("SignedInfo", Ds)[0]!;
+        // SignedInfo is canonicalised in document context, so take it before detaching.
+        var signedInfoC14N = Canonicalizer.InclusiveInContext(signedInfo);
+        var sigValue = Convert.FromBase64String(Text(sig, "SignatureValue"));
+        var declaredDigest = Text(sig, "DigestValue");
+        var cert = new X509CertificateParser().ReadCertificate(Convert.FromBase64String(Text(sig, "X509Certificate")));
+        var keyOid = cert.CertificateStructure.SubjectPublicKeyInfo.Algorithm.Algorithm;
+        result.Signers.Insert(0, CertificateInfoParser.Parse(cert));
+
+        // 1. Reference digest: remove the signature (enveloped transform) and canonicalise.
+        sig.ParentNode!.RemoveChild(sig);
+        var actualDigest = Convert.ToBase64String(Digest(keyOid, Canonicalizer.Inclusive(working, withComments: true)));
+        if (actualDigest != declaredDigest) return "Reference digest mismatch.";
+
+        // 2. Signature over the canonicalised SignedInfo (GOST value is byte-reversed).
+        if (KzGost.IsGost(keyOid)) Array.Reverse(sigValue);
+        if (!KzSignatures.Verify(cert, signedInfoC14N, sigValue)) return "SignedInfo signature invalid.";
+
+        // 3. Trust: the signature is cryptographically sound, but only trust it if
+        // the signer certificate chains to a configured NCA root and is in date.
+        if (trust != null)
+        {
+            var chain = trust.Validate(cert, checkRevocation: checkRevocation);
+            if (!chain.Trusted) return chain.Error;
+        }
+        return null;
     }
 
     // ---- structure builders -------------------------------------------------

@@ -34,8 +34,12 @@ public sealed class KzCryptoService
     public static KzCryptoService FromPkcs12(string path, string password, ChainValidator? trust = null)
         => new(Pkcs12Loader.Load(path, password), trust);
 
-    public static KzCryptoService FromPkcs12(byte[] p12, string password, ChainValidator? trust = null)
-        => new(Pkcs12Loader.Load(p12, password), trust);
+    /// <param name="alias">Key to use when the store holds several (see <see cref="Pkcs12Loader.List"/>).</param>
+    public static KzCryptoService FromPkcs12(byte[] p12, string password, ChainValidator? trust = null, string? alias = null)
+        => new(Pkcs12Loader.Load(p12, password, alias), trust);
+
+    /// <summary>The signing certificate this service signs with.</summary>
+    public Org.BouncyCastle.X509.X509Certificate Certificate => _key.Certificate;
 
     /// <summary>Information about the loaded signing certificate (IIN/BIN, name, validity).</summary>
     public CertificateInfo CertificateInfo => CertificateInfoParser.Parse(_key.Certificate);
@@ -58,7 +62,13 @@ public sealed class KzCryptoService
 
     // ---- CMS / PKCS#7 -------------------------------------------------------
 
-    public byte[] SignCms(byte[] data, bool detached = false) => CmsService.Sign(_key, data, detached);
+    /// <param name="tsa">When set, the signature carries an RFC 3161 timestamp from it.</param>
+    public byte[] SignCms(byte[] data, bool detached = false, ITimestampAuthority? tsa = null)
+        => CmsService.Sign(new[] { _key }, data, detached, tsa);
+
+    /// <summary>Co-sign an existing CMS (earlier signers are kept untouched).</summary>
+    public byte[] AddCmsSigner(byte[] cms, byte[]? externalContent = null, ITimestampAuthority? tsa = null)
+        => CmsService.AddSigners(cms, new[] { _key }, externalContent, tsa);
 
     public VerifyResult VerifyCms(byte[] cms, byte[]? externalContent = null, bool checkRevocation = true)
         => CmsService.Verify(cms, externalContent, _trust, checkRevocation);

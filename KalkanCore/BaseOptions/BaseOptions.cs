@@ -41,4 +41,7 @@ public class KalkanOption
     /// be noticed. The NCA responder sends no nextUpdate, so this is the only bound. 0 = no cache.
     /// </summary>
     public int OcspCacheMinutes { get; init; } = 5;
+
+    /// <summary>NCA time-stamping authority used for CMS signatures with WithTsp.</summary>
+    public string? TspUrl { get; init; }
 }

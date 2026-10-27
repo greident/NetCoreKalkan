@@ -53,6 +53,21 @@ public class ChainValidatorTests
         Assert.Equal(3, result.Path.Count);
     }
 
+    // The current RSA hierarchy (NCA RSA 2022 under the 2020 RSA root). The TSA certificate
+    // embedded in a real NCA timestamp token is issued by it.
+    [Fact]
+    public void TrustsRealNcaCert_Rsa2022Hierarchy()
+    {
+        var validator = Fixtures.ProductionTrust();
+        var tsa = new Org.BouncyCastle.Tsp.TimeStampToken(new Org.BouncyCastle.Cms.CmsSignedData(Fixtures.NcaTstRsa2022))
+            .GetCertificates().EnumerateMatches(null).Single();
+
+        var result = validator.ValidateChainOnly(tsa, atUtc: new DateTime(2026, 10, 27, 0, 0, 0, DateTimeKind.Utc));
+
+        Assert.True(result.Trusted, result.Error);
+        Assert.Equal(3, result.Path.Count);
+    }
+
     [Fact]
     public void RejectsRealNcaCert_WhenExpired()
     {
