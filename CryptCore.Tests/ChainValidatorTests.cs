@@ -27,6 +27,47 @@ public class ChainValidatorTests
         Assert.Equal(3, result.Path.Count);
     }
 
+    // Canary for the GOST-2004 (34.310-2004) curve mapping in KzGost: the 2015/2018
+    // hierarchy and the БЕКБАУОВ leaf are all GOST-2004 signed, so both links only verify
+    // if the CryptoPro-A parameter set really is the KZ 256-bit curve.
+    [Fact]
+    public void TrustsRealNcaCert_Gost2004Hierarchy()
+    {
+        var validator = Fixtures.ProductionTrust();
+
+        var result = validator.ValidateChainOnly(Fixtures.LoadCert(Fixtures.BekbauovGostCertPath), atUtc: Fixtures.BekbauovValidInstant);
+
+        Assert.True(result.Trusted, result.Error);
+        // leaf -> intermediate (NCA GOST) -> root (GOST)
+        Assert.Equal(3, result.Path.Count);
+    }
+
+    [Fact]
+    public void TrustsRealNcaCert_RsaHierarchy()
+    {
+        var validator = Fixtures.ProductionTrust();
+
+        var result = validator.ValidateChainOnly(Fixtures.LoadCert(Fixtures.BekbauovRsaCertPath), atUtc: Fixtures.BekbauovValidInstant);
+
+        Assert.True(result.Trusted, result.Error);
+        Assert.Equal(3, result.Path.Count);
+    }
+
+    // The current RSA hierarchy (NCA RSA 2022 under the 2020 RSA root). The TSA certificate
+    // embedded in a real NCA timestamp token is issued by it.
+    [Fact]
+    public void TrustsRealNcaCert_Rsa2022Hierarchy()
+    {
+        var validator = Fixtures.ProductionTrust();
+        var tsa = new Org.BouncyCastle.Tsp.TimeStampToken(new Org.BouncyCastle.Cms.CmsSignedData(Fixtures.NcaTstRsa2022))
+            .GetCertificates().EnumerateMatches(null).Single();
+
+        var result = validator.ValidateChainOnly(tsa, atUtc: new DateTime(2026, 10, 27, 0, 0, 0, DateTimeKind.Utc));
+
+        Assert.True(result.Trusted, result.Error);
+        Assert.Equal(3, result.Path.Count);
+    }
+
     [Fact]
     public void RejectsRealNcaCert_WhenExpired()
     {

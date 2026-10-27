@@ -22,6 +22,16 @@ public static class Fixtures
     public static string InfraDir { get; } = LocateInfra();
 
     public static string CaCertsDir => Path.Combine(InfraDir, "Ca_Certs");
+
+    /// <summary>CryptCore.Tests/TestData: real NCA artefacts captured for interop tests.</summary>
+    public static string TestDataDir => Path.Combine(InfraDir, "..", "..", "CryptCore.Tests", "TestData");
+
+    /// <summary>
+    /// Timestamp tokens issued by tsp.pki.gov.kz on 2026-10-27 — genuine Kalkan-produced CMS
+    /// SignedData: GOST-2015 (policy 1.2.398.3.3.2.6.4) and RSA (1.2.398.3.3.2.6.2).
+    /// </summary>
+    public static byte[] NcaTstGost2015 => File.ReadAllBytes(Path.Combine(TestDataDir, "nca_tst_gost2015.der"));
+    public static byte[] NcaTstRsa2022 => File.ReadAllBytes(Path.Combine(TestDataDir, "nca_tst_rsa2022.der"));
     public static string PemsDir => Path.Combine(InfraDir, "Certs", "Pems");
 
     /// <summary>End-entity test certificate "МАМЕТОВ ДАУЛЕТ" (IIN850717351069), GOST-2015.</summary>
@@ -29,6 +39,15 @@ public static class Fixtures
 
     /// <summary>The МАМЕТОВ certificate was valid Oct 2024 .. Oct 2025; pick an instant inside that.</summary>
     public static readonly DateTime MametovValidInstant = new(2025, 1, 15, 0, 0, 0, DateTimeKind.Utc);
+
+    /// <summary>End-entity "БЕКБАУОВ БАГЛАН" (IIN830116301379), GOST-2004, issued by the 2018 NCA GOST CA.</summary>
+    public static string BekbauovGostCertPath => Path.Combine(PemsDir, "certificateGost.pem");
+
+    /// <summary>Same person, RSA certificate issued by the 2018 NCA RSA CA.</summary>
+    public static string BekbauovRsaCertPath => Path.Combine(PemsDir, "certificateRsa.pem");
+
+    /// <summary>Both БЕКБАУОВ certificates were valid Feb 2024 .. Feb 2025, as were their CAs.</summary>
+    public static readonly DateTime BekbauovValidInstant = new(2024, 6, 1, 0, 0, 0, DateTimeKind.Utc);
 
     public static X509Certificate LoadCert(string path)
     {

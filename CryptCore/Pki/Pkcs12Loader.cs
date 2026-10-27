@@ -33,13 +33,69 @@ public static class Pkcs12Loader
 {
     public static SigningKey Load(string path, string password) => Load(File.ReadAllBytes(path), password);
 
-    public static SigningKey Load(byte[] p12, string password)
+    /// <summary>
+    /// Load the signing identity. With several keys in the store, <paramref name="alias"/>
+    /// picks one (see <see cref="List"/>); without it the store must hold exactly one key.
+    /// </summary>
+    public static SigningKey Load(byte[] p12, string password, string? alias = null)
+    {
+        var (keys, certs) = ReadBags(p12, password);
+        if (certs.Count == 0)
+            throw new InvalidOperationException("PKCS12 store contains no certificate.");
+        if (keys.Count == 0)
+            throw new InvalidOperationException("PKCS12 store contains no private key.");
+
+        KeyEntry key;
+        if (alias != null)
+            key = keys.FirstOrDefault(k => k.Alias == alias)
+                  ?? throw new InvalidOperationException($"PKCS12 store has no key with alias '{alias}'.");
+        else if (keys.Count == 1)
+            key = keys[0];
+        else
+            throw new InvalidOperationException(
+                $"PKCS12 store holds {keys.Count} keys; pass an alias ({string.Join(", ", keys.Select(k => k.Alias))}).");
+
+        var all = certs.Select(c => c.Cert).ToList();
+        var leaf = LeafFor(key, certs) ?? all[0];
+        var chain = new List<X509Certificate> { leaf };
+        chain.AddRange(all.Where(c => c != leaf));
+
+        return new SigningKey
+        {
+            Certificate = leaf,
+            PrivateKey = BuildPrivateKey(key.Info, leaf),
+            Chain = chain
+        };
+    }
+
+    /// <summary>The keys in the store as (alias, certificate) — the password is needed to read them.</summary>
+    public static IReadOnlyList<(string Alias, X509Certificate Certificate)> List(byte[] p12, string password)
+    {
+        var (keys, certs) = ReadBags(p12, password);
+        var result = new List<(string, X509Certificate)>();
+        foreach (var key in keys)
+            if ((LeafFor(key, certs) ?? certs.FirstOrDefault()?.Cert) is { } cert)
+                result.Add((key.Alias, cert));
+        return result;
+    }
+
+    private sealed record KeyEntry(PrivateKeyInfo Info, string Alias, byte[]? LocalKeyId);
+    private sealed record CertEntry(X509Certificate Cert, byte[]? LocalKeyId);
+
+    /// <summary>The certificate bound to the key by localKeyId, else by public key algorithm.</summary>
+    private static X509Certificate? LeafFor(KeyEntry key, List<CertEntry> certs)
+        => (key.LocalKeyId == null
+               ? null
+               : certs.FirstOrDefault(c => c.LocalKeyId != null && c.LocalKeyId.AsSpan().SequenceEqual(key.LocalKeyId))?.Cert)
+           ?? MatchLeaf(certs.Select(c => c.Cert).ToList(), key.Info);
+
+    private static (List<KeyEntry> Keys, List<CertEntry> Certs) ReadBags(byte[] p12, string password)
     {
         var pw = password.ToCharArray();
         var pfx = Pfx.GetInstance(Asn1Object.FromByteArray(p12));
 
-        PrivateKeyInfo? keyInfo = null;
-        var certs = new List<X509Certificate>();
+        var keys = new List<KeyEntry>();
+        var certs = new List<CertEntry>();
 
         var authSafe = Asn1Sequence.GetInstance(
             Asn1Object.FromByteArray(Asn1OctetString.GetInstance(pfx.AuthSafe.Content).GetOctets()));
@@ -69,6 +125,7 @@ public static class Pkcs12Loader
             foreach (var b in bags)
             {
                 var bag = SafeBag.GetInstance(b);
+                PrivateKeyInfo? keyInfo = null;
                 if (bag.BagID.Equals(PkcsObjectIdentifiers.Pkcs8ShroudedKeyBag))
                 {
                     var epki = EncryptedPrivateKeyInfo.GetInstance(bag.BagValue);
@@ -83,28 +140,37 @@ public static class Pkcs12Loader
                 {
                     var certBag = CertBag.GetInstance(bag.BagValue);
                     var der = Asn1OctetString.GetInstance(certBag.CertValue).GetOctets();
-                    certs.Add(new X509CertificateParser().ReadCertificate(der));
+                    certs.Add(new CertEntry(new X509CertificateParser().ReadCertificate(der), LocalKeyId(bag)));
+                }
+
+                if (keyInfo != null)
+                {
+                    var localKeyId = LocalKeyId(bag);
+                    var alias = FriendlyName(bag)
+                                ?? (localKeyId != null ? Convert.ToHexString(localKeyId).ToLowerInvariant() : $"key{keys.Count}");
+                    keys.Add(new KeyEntry(keyInfo, alias, localKeyId));
                 }
             }
         }
-
-        if (certs.Count == 0)
-            throw new InvalidOperationException("PKCS12 store contains no certificate.");
-        if (keyInfo == null)
-            throw new InvalidOperationException("PKCS12 store contains no private key.");
-
-        // Order the chain so the key's certificate comes first.
-        var leaf = MatchLeaf(certs, keyInfo) ?? certs[0];
-        var chain = new List<X509Certificate> { leaf };
-        chain.AddRange(certs.Where(c => c != leaf));
-
-        return new SigningKey
-        {
-            Certificate = leaf,
-            PrivateKey = BuildPrivateKey(keyInfo, leaf),
-            Chain = chain
-        };
+        return (keys, certs);
     }
+
+    private static Asn1Encodable? BagAttribute(SafeBag bag, DerObjectIdentifier type)
+    {
+        if (bag.BagAttributes == null) return null;
+        foreach (var a in bag.BagAttributes)
+        {
+            var attr = AttributePkcs.GetInstance(a);
+            if (attr.AttrType.Equals(type) && attr.AttrValues.Count > 0) return attr.AttrValues[0];
+        }
+        return null;
+    }
+
+    private static string? FriendlyName(SafeBag bag)
+        => BagAttribute(bag, PkcsObjectIdentifiers.Pkcs9AtFriendlyName) is IAsn1String s ? s.GetString() : null;
+
+    private static byte[]? LocalKeyId(SafeBag bag)
+        => BagAttribute(bag, PkcsObjectIdentifiers.Pkcs9AtLocalKeyID) is Asn1OctetString os ? os.GetOctets() : null;
 
     private static byte[] Decrypt(AlgorithmIdentifier algId, byte[] data, char[] password)
     {

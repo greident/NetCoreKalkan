@@ -4,6 +4,7 @@ using Org.BouncyCastle.Asn1.Rosstandart;
 using Org.BouncyCastle.Asn1.X509;
 using Org.BouncyCastle.Crypto;
 using Org.BouncyCastle.Crypto.Digests;
+using Org.BouncyCastle.Crypto.Engines;
 using Org.BouncyCastle.Crypto.Parameters;
 using Org.BouncyCastle.Crypto.Signers;
 using Org.BouncyCastle.Math;
@@ -20,10 +21,10 @@ namespace CryptCore.Pki;
 ///   * GOST 34.310-2004 (256-bit)— ECGOST3410 + GOST 34.311-95 hash.
 ///   * GOST 34.10-2015  (512-bit)— ECGOST3410-2012 + Streebog-512 hash.
 ///
-/// The native Kalkan provider keeps the curve parameters closed-source, so the
-/// curve domain parameters below are the *best known* mapping onto the published
-/// CryptoPro / TC26 parameter sets. If signature verification of a real KZ GOST
-/// certificate fails, override the mapping at startup via
+/// The native Kalkan provider keeps the parameters closed-source; the mapping below onto
+/// the published CryptoPro / TC26 sets was confirmed by verifying real NCA certificate
+/// signatures (GOST-2015: the 2022 hierarchy; GOST-2004: the 2015/2018 hierarchy). If a
+/// certificate from another curve ever appears, override the mapping at startup via
 /// <see cref="RegisterCurve"/> with the authentic parameters.
 /// </summary>
 public static class KzGost
@@ -63,9 +64,9 @@ public static class KzGost
 
     static KzGost()
     {
-        // Default (unverified) curve mapping. The 512-bit KZ set is widely held to
-        // coincide with TC26 paramSetA; the 256-bit set with CryptoPro-A.
-        // Replace via RegisterCurve(...) if a real cert fails to verify.
+        // Curve mapping, confirmed against real NCA certificates: the 512-bit KZ set is
+        // TC26 paramSetA, the 256-bit set CryptoPro-A (keys lie on it and CA signatures verify).
+        // Replace via RegisterCurve(...) if a certificate from another curve appears.
         RegisterCurve(CurveGost2015.Id,
             ECGost3410NamedCurves.GetByOid(RosstandartObjectIdentifiers.id_tc26_gost_3410_12_512_paramSetA));
         RegisterCurve(CurveGost2004.Id,
@@ -93,9 +94,16 @@ public static class KzGost
     /// Fresh digest matching the GOST generation. Accepts a key, signature or
     /// digest OID (the 2015 digest 1.2.398.3.10.1.3.3 maps to Streebog-512,
     /// the 2004 digest 1.2.398.3.10.1.3.1 to GOST 34.311-95).
+    ///
+    /// GOST 34.311-95 is parameterised by a GOST 28147 S-box; KZ uses the GOST R 34.11-94
+    /// *test* set (digest param 1.2.398.3.10.1.3.1.1.0), not BouncyCastle's default
+    /// CryptoPro "D-A". Confirmed against the real 2015/2018 NCA GOST hierarchy: every
+    /// certificate signature there verifies with "D-TEST" and none with "D-A".
     /// </summary>
     public static IDigest CreateDigest(DerObjectIdentifier oid) =>
-        IsGost2015(oid) || oid.Equals(DigestGost2015) ? new Gost3411_2012_512Digest() : new Gost3411Digest();
+        IsGost2015(oid) || oid.Equals(DigestGost2015)
+            ? new Gost3411_2012_512Digest()
+            : new Gost3411Digest(Gost28147Engine.GetSBox("D-TEST"));
 
     /// <summary>
     /// Fresh DSA-style signer. BouncyCastle's <see cref="ECGost3410Signer"/> performs
@@ -103,6 +111,41 @@ public static class KzGost
     /// only the digest (and field size) differ, which is handled by CreateDigest.
     /// </summary>
     public static IDsa CreateSigner(DerObjectIdentifier sigOrKeyOid) => new ECGost3410Signer();
+
+    /// <summary>
+    /// Verify a GOST signature over <paramref name="data"/> made by the key in
+    /// <paramref name="signerKey"/> — the check behind PKI objects (certificates, CRLs,
+    /// OCSP responses) signed by an NCA CA. KZ stores GOST signature values byte-reversed
+    /// vs BouncyCastle in the XML/CMS profiles, and the convention for PKI objects is not
+    /// guaranteed, so either orientation is accepted; the signature must still verify
+    /// mathematically. Any decode/verify failure is reported as false.
+    /// </summary>
+    public static bool VerifyEitherOrientation(
+        SubjectPublicKeyInfo signerKey, byte[] data, byte[] signature, DerObjectIdentifier sigAlg)
+    {
+        ECPublicKeyParameters pub;
+        try { pub = DecodePublicKey(signerKey); }
+        catch { return false; } // not a GOST key -> cannot have produced a GOST signature
+
+        var reversed = (byte[])signature.Clone();
+        Array.Reverse(reversed);
+        return Verify(pub, data, signature, sigAlg) || Verify(pub, data, reversed, sigAlg);
+    }
+
+    private static bool Verify(ECPublicKeyParameters pub, byte[] data, byte[] sig, DerObjectIdentifier alg)
+    {
+        try
+        {
+            var signer = new Gost3410DigestSigner(CreateSigner(alg), CreateDigest(alg));
+            signer.Init(false, pub);
+            signer.BlockUpdate(data, 0, data.Length);
+            return signer.VerifySignature(sig);
+        }
+        catch
+        {
+            return false;
+        }
+    }
 
     /// <summary>
     /// Decode a GOST public key from a SubjectPublicKeyInfo whose algorithm OID is

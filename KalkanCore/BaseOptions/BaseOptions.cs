@@ -28,4 +28,20 @@ public class KalkanOption
     /// carries no AIA OCSP entry. Only consulted for requests with ValidateOcsp=true.
     /// </summary>
     public string? OcspResponderUrl { get; init; }
+
+    /// <summary>
+    /// When true, every verification checks revocation (OCSP → CRL) regardless of the
+    /// request's ValidateOcsp flag, so a caller that omits it cannot skip the check.
+    /// Only takes effect together with <see cref="CaCertsPath"/>.
+    /// </summary>
+    public bool RequireRevocationCheck { get; init; }
+
+    /// <summary>
+    /// How long an OCSP good/revoked answer is reused — i.e. how late a fresh revocation may
+    /// be noticed. The NCA responder sends no nextUpdate, so this is the only bound. 0 = no cache.
+    /// </summary>
+    public int OcspCacheMinutes { get; init; } = 5;
+
+    /// <summary>NCA time-stamping authority used for CMS signatures with WithTsp.</summary>
+    public string? TspUrl { get; init; }
 }

@@ -1,4 +1,5 @@
 <Solution>
   <Project Path="KalkanCore/KalkanCore.csproj" />
   <Project Path="CryptCore/CryptCore.csproj" />
+  <Project Path="CryptCore.Tests/CryptCore.Tests.csproj" />
 </Solution>

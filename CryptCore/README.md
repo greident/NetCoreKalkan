@@ -64,9 +64,13 @@ recovered by confirming that the public keys of real NCA certificates lie on
 known parameter sets:
 
 * GOST 34.10-2015 (512-bit) → TC26 `paramSetA`
-* GOST 34.310-2004 (256-bit) → CryptoPro-A
+* GOST 34.310-2004 (256-bit) → CryptoPro-A, with the GOST 34.311-95 hash on the
+  GOST R 34.11-94 **test** S-box (`D-TEST`), not BouncyCastle's default `D-A`
 
-Both are validated by signing/verifying with the certificate's own key pair. If
+GOST-2015 is validated by signing/verifying with a real key pair and by chaining the
+2022 NCA hierarchy; GOST-2004 by verifying every signature of the 2015/2018 NCA
+hierarchy down to a real end-entity certificate (no GOST-2004 private key is
+available, so GOST-2004 *signing* is not yet cross-checked against Kalkan). If
 a certificate from a different curve ever appears, override the mapping at
 startup:
 

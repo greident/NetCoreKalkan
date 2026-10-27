@@ -16,6 +16,8 @@ builder.Services.AddOpenApi(options =>
 
 builder.AddOption();
 
+builder.AddHealth();
+
 builder.WebHost.ConfigureKestrel(options =>
 {
     options.AllowSynchronousIO = true;
@@ -26,6 +28,7 @@ var app = builder.Build();
 
 
 app.AddCryptApi();
+app.MapHealth();
 
 app.MapOpenApi();
 app.MapScalarUi();

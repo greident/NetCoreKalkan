@@ -29,43 +29,96 @@ public static class CmsService
     /// Produce a CMS signature over <paramref name="data"/>.
     /// </summary>
     /// <param name="detached">If true the content is not embedded (signature only).</param>
-    public static byte[] Sign(SigningKey key, byte[] data, bool detached = false)
-    {
-        var digestAlg = DigestAlgId(key);
-        var contentDigest = Hash(key, data);
+    public static byte[] Sign(SigningKey key, byte[] data, bool detached = false) => Sign(new[] { key }, data, detached);
 
+    /// <summary>
+    /// Produce a CMS with one SignerInfo per key over <paramref name="data"/>; with
+    /// <paramref name="tsa"/>, each signature gets an RFC 3161 timestamp (unsigned attribute
+    /// id-aa-signatureTimeStampToken) proving when it was made.
+    /// </summary>
+    public static byte[] Sign(IReadOnlyList<SigningKey> keys, byte[] data, bool detached = false, ITimestampAuthority? tsa = null)
+    {
+        if (keys.Count == 0) throw new ArgumentException("At least one signing key is required.", nameof(keys));
+        return Assemble(
+            keys.Select(DigestAlgId),
+            new ContentInfo(CmsObjectIdentifiers.Data, detached ? null : new DerOctetString(data)),
+            keys.SelectMany(k => k.Chain).Select(c => c.CertificateStructure),
+            null,
+            keys.Select(k => BuildSignerInfo(k, data, tsa)));
+    }
+
+    /// <summary>
+    /// Add signers to an existing CMS. Existing SignerInfos (and their timestamps) are kept
+    /// byte for byte; nothing is re-signed. A detached CMS needs <paramref name="externalContent"/>.
+    /// </summary>
+    public static byte[] AddSigners(byte[] cms, IReadOnlyList<SigningKey> keys, byte[]? externalContent = null, ITimestampAuthority? tsa = null)
+    {
+        if (keys.Count == 0) throw new ArgumentException("At least one signing key is required.", nameof(keys));
+        var signedData = SignedData.GetInstance(ContentInfo.GetInstance(Asn1Object.FromByteArray(cms)).Content);
+        if (!signedData.EncapContentInfo.ContentType.Equals(CmsObjectIdentifiers.Data))
+            throw new NotSupportedException($"Only id-data content can be co-signed (got {signedData.EncapContentInfo.ContentType}).");
+
+        var embedded = signedData.EncapContentInfo.Content is Asn1OctetString os ? os.GetOctets() : null;
+        if (embedded != null && externalContent != null && !embedded.AsSpan().SequenceEqual(externalContent))
+            throw new ArgumentException("The data passed differs from the content embedded in the CMS.");
+        var content = embedded ?? externalContent
+                      ?? throw new ArgumentException("Detached CMS: pass the signed data to add a signer.");
+
+        return Assemble(
+            signedData.DigestAlgorithms.Cast<Asn1Encodable>().Select(AlgorithmIdentifier.GetInstance).Concat(keys.Select(DigestAlgId)),
+            signedData.EncapContentInfo,
+            (signedData.Certificates?.Cast<Asn1Encodable>().Select(X509CertificateStructure.GetInstance)
+             ?? Enumerable.Empty<X509CertificateStructure>()).Concat(keys.SelectMany(k => k.Chain).Select(c => c.CertificateStructure)),
+            signedData.CRLs,
+            signedData.SignerInfos.Cast<Asn1Encodable>().Select(SignerInfo.GetInstance).Concat(keys.Select(k => BuildSignerInfo(k, content, tsa))));
+    }
+
+    private static SignerInfo BuildSignerInfo(SigningKey key, byte[] data, ITimestampAuthority? tsa)
+    {
         // Signed attributes: contentType + messageDigest + signingTime (RFC 5652 §11).
         var signedAttrs = new Asn1EncodableVector
         {
             new AttributeCms(CmsAttributes.ContentType, new DerSet(CmsObjectIdentifiers.Data)),
-            new AttributeCms(CmsAttributes.MessageDigest, new DerSet(new DerOctetString(contentDigest))),
+            new AttributeCms(CmsAttributes.MessageDigest, new DerSet(new DerOctetString(Hash(key, data)))),
             new AttributeCms(CmsAttributes.SigningTime, new DerSet(new Org.BouncyCastle.Asn1.Cms.Time(DateTime.UtcNow)))
         };
         var attrSet = new DerSet(signedAttrs);
         var signature = KzSignatures.Sign(key, attrSet.GetEncoded(Asn1Encodable.Der));
+        // Kalkan stores the GOST signature value byte-reversed relative to BouncyCastle's
+        // r||s, in CMS just as in XML (confirmed on NCA TSA tokens). RSA is unaffected.
+        if (key.IsGost) Array.Reverse(signature);
 
-        var signerInfo = new SignerInfo(
+        // RFC 3161 Appendix A: the timestamp covers the signature value as stored.
+        DerSet? unsignedAttrs = null;
+        if (tsa != null)
+        {
+            var token = Asn1Object.FromByteArray(tsa.Timestamp(signature, key));
+            unsignedAttrs = new DerSet(new AttributeCms(PkcsObjectIdentifiers.IdAASignatureTimeStampToken, new DerSet(token)));
+        }
+
+        return new SignerInfo(
             new SignerIdentifier(IssuerAndSerial(key.Certificate)),
-            digestAlg,
+            DigestAlgId(key),
             attrSet,
             SignatureAlgId(key),
             new DerOctetString(signature),
-            null);
+            unsignedAttrs);
+    }
 
-        var certs = new DerSet(key.Chain.Select(c => c.CertificateStructure).Cast<Asn1Encodable>().ToArray());
-        var encap = detached
-            ? new ContentInfo(CmsObjectIdentifiers.Data, null)
-            : new ContentInfo(CmsObjectIdentifiers.Data, new DerOctetString(data));
+    private static byte[] Assemble(
+        IEnumerable<AlgorithmIdentifier> digestAlgs, ContentInfo encap, IEnumerable<X509CertificateStructure> certs,
+        Asn1Set? crls, IEnumerable<SignerInfo> signerInfos)
+    {
+        static Asn1Encodable[] Distinct(IEnumerable<Asn1Encodable> items)
+            => items.DistinctBy(i => Convert.ToBase64String(i.GetEncoded(Asn1Encodable.Der))).ToArray();
 
         var signedData = new SignedData(
-            new DerSet(digestAlg),
+            new DerSet(Distinct(digestAlgs)),
             encap,
-            new DerSet(certs.ToArray()),
-            null,
-            new DerSet(signerInfo));
-
-        var contentInfo = new ContentInfo(CmsObjectIdentifiers.SignedData, signedData);
-        return contentInfo.GetEncoded(Asn1Encodable.Der);
+            new DerSet(Distinct(certs)),
+            crls,
+            new DerSet(signerInfos.Cast<Asn1Encodable>().ToArray()));
+        return new ContentInfo(CmsObjectIdentifiers.SignedData, signedData).GetEncoded(Asn1Encodable.Der);
     }
 
     /// <summary>Verify a CMS blob. Pass <paramref name="externalContent"/> for detached signatures.</summary>
@@ -98,49 +151,119 @@ public static class CmsService
         return result;
     }
 
+    /// <summary>
+    /// The content embedded in an attached CMS, or null for a detached one. Does not
+    /// verify anything — pair it with <see cref="Verify"/> before trusting the bytes.
+    /// </summary>
+    public static byte[]? ExtractContent(byte[] cms)
+    {
+        var signedData = SignedData.GetInstance(ContentInfo.GetInstance(Asn1Object.FromByteArray(cms)).Content);
+        return signedData.EncapContentInfo.Content is Asn1OctetString os ? os.GetOctets() : null;
+    }
+
     private static bool VerifySigner(SignerInfo signer, List<X509Certificate> certs, byte[]? content, VerifyResult result, ChainValidator? trust, bool checkRevocation)
     {
         var cert = FindCert(certs, signer.SignerID);
         if (cert == null) { result.Error = "Signer certificate not found in CMS."; return false; }
-        result.Signers.Add(CertificateInfoParser.Parse(cert));
+        var info = CertificateInfoParser.Parse(cert);
+        result.Signers.Add(info);
+        // For RSA, verify with the signer's digest (SHA-256, -384, -512…); GOST picks its own.
+        var rsaAlgorithm = (DigestUtilities.GetAlgorithmName(signer.DigestAlgorithm.Algorithm) ?? "SHA256").Replace("-", "") + "withRSA";
 
         var signature = signer.EncryptedDigest.GetOctets();
+        // Kalkan byte order for GOST (see Sign).
+        if (KzGost.IsGost(cert.CertificateStructure.SubjectPublicKeyInfo.Algorithm.Algorithm))
+            signature = signature.Reverse().ToArray();
         var signedAttrs = signer.AuthenticatedAttributes;
+
+        // Without content only the signed attributes could be checked, which proves nothing
+        // about *what* was signed — a detached CMS needs the data passed alongside.
+        if (content == null) { result.Error = "No content to verify (detached CMS: pass the signed data)."; return false; }
 
         bool cryptoOk;
         if (signedAttrs != null)
         {
             // messageDigest attribute must equal the digest of the content.
-            if (content != null)
+            var declared = MessageDigest(signedAttrs);
+            var actual = HashWith(signer.DigestAlgorithm.Algorithm, content);
+            if (declared == null || !declared.SequenceEqual(actual))
             {
-                var declared = MessageDigest(signedAttrs);
-                var actual = HashWith(signer.DigestAlgorithm.Algorithm, content);
-                if (declared == null || !declared.SequenceEqual(actual))
-                {
-                    result.Error = "messageDigest mismatch.";
-                    return false;
-                }
+                result.Error = "messageDigest mismatch.";
+                return false;
             }
             // Signature is over the DER SET OF signed attributes.
             var signedBytes = new DerSet(signedAttrs.ToArray()).GetEncoded(Asn1Encodable.Der);
-            cryptoOk = KzSignatures.Verify(cert, signedBytes, signature);
+            cryptoOk = KzSignatures.Verify(cert, signedBytes, signature, rsaAlgorithm);
         }
         else
         {
-            if (content == null) { result.Error = "No content to verify."; return false; }
-            cryptoOk = KzSignatures.Verify(cert, content, signature);
+            cryptoOk = KzSignatures.Verify(cert, content, signature, rsaAlgorithm);
         }
 
         if (!cryptoOk) { result.Error = "Signature invalid."; return false; }
+
+        // A timestamp proves when the signature was made, so the certificate is judged at
+        // that moment: a signature made while the certificate was valid stays valid after
+        // it expires. Revocation is still checked as of now (conservative).
+        DateTime? signedAt = null;
+        if (TimestampToken(signer) is { } token)
+        {
+            var (genTime, error) = VerifyTimestamp(token, signer.EncryptedDigest.GetOctets(), trust, checkRevocation);
+            if (error != null) { result.Error = $"Timestamp invalid: {error}"; return false; }
+            signedAt = info.TimestampUtc = genTime;
+        }
 
         // Trust: only accept the signer if it chains to a configured NCA root. The
         // certificates bundled in the CMS are offered as candidate issuers (not anchors).
         if (trust != null)
         {
-            var chain = trust.Validate(cert, certs, checkRevocation: checkRevocation);
+            var chain = trust.Validate(cert, certs, atUtc: signedAt, checkRevocation: checkRevocation);
             if (!chain.Trusted) { result.Error = chain.Error; return false; }
         }
         return true;
+    }
+
+    // ---- timestamps -----------------------------------------------------------
+
+    private static byte[]? TimestampToken(SignerInfo signer)
+    {
+        if (signer.UnauthenticatedAttributes == null) return null;
+        foreach (var a in signer.UnauthenticatedAttributes)
+        {
+            var attr = AttributeCms.GetInstance(a);
+            if (attr.AttrType.Equals(PkcsObjectIdentifiers.IdAASignatureTimeStampToken))
+                return attr.AttrValues[0].ToAsn1Object().GetEncoded(Asn1Encodable.Der);
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// RFC 3161 token over <paramref name="signatureValue"/>: TSA signature valid (and, with
+    /// a trust store, its certificate chaining to an NCA root), certificate marked for time
+    /// stamping, imprint matching. Returns the proven time or the reason it is not.
+    /// </summary>
+    private static (DateTime GenTime, string? Error) VerifyTimestamp(
+        byte[] token, byte[] signatureValue, ChainValidator? trust, bool checkRevocation)
+    {
+        var tokenResult = Verify(token, null, trust, checkRevocation);
+        if (!tokenResult.Valid) return (default, tokenResult.Error);
+
+        var signedData = SignedData.GetInstance(ContentInfo.GetInstance(Asn1Object.FromByteArray(token)).Content);
+        if (!signedData.EncapContentInfo.ContentType.Equals(PkcsObjectIdentifiers.IdCTTstInfo))
+            return (default, "not a TSTInfo token.");
+        if (signedData.SignerInfos.Count != 1) return (default, "a timestamp token must have exactly one signer.");
+
+        var tsa = FindCert(LoadCerts(signedData), SignerInfo.GetInstance(signedData.SignerInfos[0]).SignerID);
+        if (tsa?.GetExtendedKeyUsage()?.Contains(KeyPurposeID.id_kp_timeStamping) != true)
+            return (default, "token is not signed by a time-stamping certificate.");
+
+        var tstInfo = Org.BouncyCastle.Asn1.Tsp.TstInfo.GetInstance(
+            Asn1Object.FromByteArray(Asn1OctetString.GetInstance(signedData.EncapContentInfo.Content).GetOctets()));
+        var imprint = tstInfo.MessageImprint;
+        if (!HashWith(imprint.HashAlgorithm.Algorithm, signatureValue).AsSpan().SequenceEqual(imprint.GetHashedMessage()))
+            return (default, "token does not cover this signature.");
+
+        return (tstInfo.GenTime.ToDateTime().ToUniversalTime(), null);
     }
 
     // ---- helpers ------------------------------------------------------------
@@ -157,7 +280,7 @@ public static class CmsService
         ? HashWith(key.KeyAlgorithm, data)
         : DigestUtilities.CalculateDigest("SHA-256", data);
 
-    private static byte[] HashWith(DerObjectIdentifier algOid, byte[] data)
+    internal static byte[] HashWith(DerObjectIdentifier algOid, byte[] data)
     {
         if (KzGost.IsGostAny(algOid))
         {

@@ -20,27 +20,96 @@
 - Самоподписанные сертификаты из стора → trust anchors; остальные → промежуточные.
 - `Validate(...)` = цепочка + срок + отзыв; `ValidateChainOnly(...)` = без отзыва.
 - Fail-closed: `failOnUnknownRevocation = true` по умолчанию.
-- ⚠️ Curve-параметры GOST-2015 подтверждены тестом на боевой иерархии. **GOST-2004 не проверен**
-  (нет фикстуры) — см. ниже.
+- **Ограничения CA** (RFC 5280): каждый издатель в пути обязан иметь `basicConstraints cA=TRUE`
+  и (если есть keyUsage) `keyCertSign`; соблюдается `pathLenConstraint`. У подписанта keyUsage
+  (если есть) должен содержать `digitalSignature` или `nonRepudiation`.
+  Закрывает атаку через CMS: владелец любого обычного сертификата НУЦ выпускал своим ключом
+  сертификат на чужой ИИН/БИН, вкладывал оба в CMS — цепочка «подделка → свой серт НУЦ →
+  NCA → root» сходилась по подписям и принималась как доверенная. XML/WSSE не были
+  уязвимы (там издатели берутся только из trust-store).
+- Параметры ГОСТ подтверждены тестами на боевых иерархиях: GOST-2015 (2022) и **GOST-2004**
+  (2015/2018, сертификат БЕКБАУОВ) + RSA (2018).
+
+### `CryptCore/Pki/KzGost.cs` — ✅ ГОСТ-2004 исправлен
+- Хэш ГОСТ 34.311-95 был с S-box BouncyCastle по умолчанию (CryptoPro `D-A`); НУЦ использует
+  **тестовый набор `D-TEST`** (параметр хэша `1.2.398.3.10.1.3.1.1.0`). С `D-A` не сходилась ни
+  одна ГОСТ-2004 подпись НУЦ — проверка цепочки отклоняла все ГОСТ-2004 сертификаты, а подписи
+  ГОСТ-2004 ключами (XML/CMS/WSSE) и `DigestValue` `gost34311` были несовместимы с Kalkan.
+  Кривая (CryptoPro-A) и порядок байт подписи были верными.
 
 ### `CryptCore/Pki/IRevocationChecker.cs` — ✅ абстракция отзыва
 - Enum `RevocationStatus { Good, Revoked, Unknown }` + интерфейс. Развязывает `ChainValidator`
   от сети, делает revocation тестируемым.
 
-### `CryptCore/Pki/OcspRevocationChecker.cs` — ✅ OCSP (RFC 6960), ⚠️ wire не проверен вживую
+### `CryptCore/Pki/OcspRevocationChecker.cs` — ✅ OCSP (RFC 6960), проверен вживую
 - Запрос строится через `CertificateID`, POST на ответчик из AIA сертификата
   (fallback — `OcspResponderUrl` из конфига).
-- ГОСТ-aware проверка подписи ответа (вручную через `KzGost`, обе ориентации байт).
-- Не доверяет ответу вслепую: вшитый responder-сертификат должен быть выпущен тем же CA.
+- ГОСТ-aware проверка подписи ответа (через `KzGost.VerifyEitherOrientation`, обе ориентации байт).
+- Не доверяет ответу вслепую (OCSP идёт по голому HTTP):
+  - делегированный ответчик должен быть выпущен тем же CA, действовать сейчас **и иметь EKU
+    `id-kp-OCSPSigning`** (RFC 6960 §4.2.2.2). Раньше EKU не проверялся — владелец любого
+    обычного сертификата НУЦ мог подписать «good» для отозванного сертификата (MITM);
+  - ответ должен быть **про запрошенный сертификат** (сверка серийника и хэшей издателя
+    в CertID). Раньше брался первый ответ — валидный «good» про чужой сертификат проходил;
+  - **nonce**: в запрос кладётся случайный nonce, в ответе он обязан совпасть. Если ответчик
+    его не вернул — ответ должен быть не старше `MaxResponseAge` (10 мин);
+  - `thisUpdate` не из будущего (допуск 5 мин), `nextUpdate` (если есть) не в прошлом.
+- **Кэш**: `Good`/`Revoked` переиспользуются `CacheTtl` (5 мин; ограничено `nextUpdate`, которого
+  у НУЦ нет), до 10 000 записей. `Unknown` не кэшируется. Это и есть задержка, с которой
+  видна новая отозванность.
 - Сеть/парс-ошибка/недоверенный ответ → `Unknown`.
-- ⚠️ **Hash-алгоритм CertID = SHA-256 по умолчанию** (`CertIdHashAlgorithm`). НУЦ РК может
-  ждать SHA-1 — не подтверждено против живого ответчика. См. раздел «Что нужно сделать».
+- Промежуточные CA НУЦ (`nca_gost_2022`, `nca_rsa`, …) **не имеют OCSP в AIA**, а
+  `ocsp.pki.gov.kz` отвечает на них `malformedRequest`. Для CA-сертификатов без AIA OCSP
+  запрос на fallback-ответчик не шлётся → `Unknown` сразу, их статус даёт CRL корня.
+  (До этого фикса `ValidateOcsp=true` + fail-closed отклонял **любую** подпись.)
+- Живой `ocsp.pki.gov.kz` (проверено 2026-10-27): CertID и с **SHA-256**, и с **SHA-1** → `good`;
+  ответ подписан ГОСТ-2015 сертификатом «OCSP GOST» (EKU OCSP Signing, действует
+  07.2026–07.2027), выпущенным `nca_gost_2022`; **nonce возвращается**; `nextUpdate` нет.
+
+### `CryptCore/Pki/CrlRevocationChecker.cs` — ✅ CRL, проверен вживую
+- URL из CDP-расширения сертификата (только http/https), скачивание, проверка, что CRL выпущен
+  издателем сертификата (DN + подпись, ГОСТ — через `KzGost`, RSA — через BouncyCastle).
+- CRL с истёкшим `nextUpdate`, чужой подписью или недоступный → `Unknown`.
+- Кэш в памяти до `nextUpdate` (набор отозванных серийников); одна загрузка на URL одновременно.
+- Размеры НУЦ: CRL корня на промежуточные CA ~0.5 КБ (обновление раз в месяц), CRL НУЦ на
+  конечные сертификаты **~20 МБ** (раз в сутки; загрузка + разбор ≈ 9 с).
+- **Delta-CRL** из расширения `Freshest CRL` (`nca_d_gost_2022.crl`, ~5 КБ, раз в ~6 ч)
+  накладывается на базовый: отзыв из delta → `Revoked`, `removeFromCRL` снимает удержание.
+  Delta применяется, только если номер базового CRL ≥ её `BaseCRLNumber` (RFC 5280 §5.2.4);
+  недоступная/неподходящая delta не ломает проверку — отвечает базовый CRL.
+  Базовый CRL с `DeltaCRLIndicator` (подмена базового на короткую delta) отвергается.
+
+### `CryptCore/Pki/CompositeRevocationChecker.cs` — ✅ OCSP → CRL
+- Первый определённый ответ (`Good`/`Revoked`) выигрывает; `Unknown` только если все `Unknown`.
 
 ### `CryptCore/Signing/{XmlDsigService,WsseService,CmsService}.cs` — ✅ интеграция
 - Каждый `Verify` принимает `ChainValidator? trust` и `bool checkRevocation`.
 - Логика: сначала криптопроверка → если ОК и `trust != null` → `trust.Validate(...)`.
   При недоверии `Valid = false` с причиной в `Error`. `Signers` сохраняются для логов.
 - CMS: вшитые в сообщение сертификаты передаются как кандидаты-издатели (но не как анкоры).
+- CMS без содержимого (отсоединённая подпись, `data` не передан) → **невалидна**. Раньше
+  `messageDigest` при отсутствии содержимого не сверялся: проверялась только подпись над
+  атрибутами, и любая настоящая CMS с вырезанным содержимым проходила как `Valid`.
+- **ГОСТ-подпись в CMS — в порядке байт Kalkan** (перевёрнутая относительно BouncyCastle, как в
+  XML/WSSE). Раньше CMS подписывалась и проверялась в прямом порядке: свой круг sign→verify
+  сходился, но настоящие ГОСТ-CMS НУЦ не проверялись, а наши ГОСТ-CMS не принял бы Kalkan.
+  Найдено и закреплено тестом на настоящих метках времени НУЦ (`CryptCore.Tests/TestData`).
+- RSA в CMS проверяется по `digestAlgorithm` подписанта (SHA-256/384/512), а не только SHA-256.
+- **Несколько подписантов.** CMS: `Sign(keys…)` — несколько SignerInfo сразу; `AddSigners` —
+  дописать к готовой CMS, прежние SignerInfo (и их метки) не трогаются. XML: подпись уже
+  подписанного документа дописывает ещё одну `ds:Signature`, покрывающую предыдущие (как
+  NCANode); `Verify` проверяет все — с последней к первой, каждую на документе без неё и
+  последующих. Удаление *последней* подписи этим не обнаруживается (свойство схемы):
+  требуемых подписантов проверять по `Signers`.
+- **Метки времени (RFC 3161).** `TspClient` (http://tsp.pki.gov.kz) ставит метку на значение
+  подписи (атрибут `id-aa-signatureTimeStampToken`); политика по ключу: ГОСТ →
+  `1.2.398.3.3.2.6.4` (TSA под NCA GOST 2022), RSA → `1.2.398.3.3.2.6.2` (под NCA RSA 2022);
+  `.6.1` (ГОСТ-2004) TSA больше не обслуживает, `.6.3` не знает. При проверке: подпись TSA,
+  его цепочка до корня НУЦ (с trust-store), EKU `timeStamping`, imprint = хэш значения
+  подписи. **Срок сертификата подписанта сверяется на время метки** (подпись, сделанная пока
+  сертификат действовал, валидна и после его истечения); отзыв — на текущий момент
+  (консервативно: сертификат, отозванный после подписи, всё равно даёт отказ).
+  Время метки — в `Signers[i].TimestampUtc`.
 
 ### `CryptCore/KzCryptoService.cs` — ✅ проброс
 - Опциональный `ChainValidator` в конструкторе/фабриках `FromPkcs12`.
@@ -48,74 +117,121 @@
 - Без trust-стора поведение прежнее (обратная совместимость).
 
 ### `KalkanCore/Services/CryptCoreCryptService.cs` — ✅ DI-обвязка
-- Строит `OcspRevocationChecker` (общий `HttpClient`, timeout 10с) + `ChainValidator`
-  из `CaCertsPath`. При отсутствии пути — **WARNING**, что проверка цепочки отключена.
-- `VerifyDto.ValidateOcsp` → `checkRevocation` через весь стек (флаг больше не игнорируется).
+- Строит `CompositeRevocationChecker(OCSP → CRL)` (OCSP: `HttpClient` timeout 10с,
+  CRL: 60с) + `ChainValidator` из `CaCertsPath`. При отсутствии пути — **WARNING**, что
+  проверка цепочки отключена.
+- `VerifyDto.ValidateOcsp` → `checkRevocation` через весь стек (флаг больше не игнорируется;
+  несмотря на имя, включает и CRL). При `RequireRevocationCheck = true` отзыв проверяется
+  всегда — флаг запроса может только включить проверку, но не выключить.
+- HTTP API: `crypt/verify/xml`, `crypt/verify/xml/base64`, `crypt/verify/wsse`,
+  `crypt/cms/sign`, `crypt/cms/verify`, `crypt/cms/extract`, `crypt/x509/info`; ответ проверки
+  содержит `Error` с причиной отказа и всех подписантов (`Signers`; `CertInfo` — первый).
+  - `cms/extract` отдаёт данные **только вместе с вердиктом** проверки подписи — доверять
+    `Data` можно лишь при `IsValid`.
+  - `x509/info`: разбор сертификата (DER/PEM) + цепочка, срок (на `At`, по умолчанию сейчас),
+    keyUsage, отзыв. Отзыв проверяется на текущий момент, не на `At`.
+- `GET /health`: `Healthy`, если сервис подписи собирается (ключ грузится, trust-store читается);
+  иначе 503 `Unhealthy`. Без этого битый путь/пароль к `.p12` всплывал только на первом запросе.
+- **Ключ из запроса** (`SignerKeyDto`: `.p12` base64 + пароль + алиас): `SignXml`/`cms/sign`/
+  `cms/sign/add` — список `signers` (пусто → ключ сервиса), `SignWsse`/`SignWsseRaw` — `key`.
+  Ключ живёт только в памяти на время запроса, не логируется.
+- `crypt/cms/sign/add` — добавить подписантов к CMS (отсоединённой — с `data`); `withTsp`
+  у `cms/sign` и `cms/sign/add` — метка НУЦ на каждую новую подпись.
+- `crypt/pkcs12/aliases` — алиасы ключей (`friendlyName`, иначе `localKeyId`);
+  `crypt/pkcs12/info` — по каждому ключу алиас + проверка сертификата (как `x509/info`).
+  `.p12` с несколькими ключами без алиаса подписывать отказывается (раньше брался последний).
+- Ошибки входных данных (неверный пароль, нет алиаса, отсоединённая CMS без данных) → **400**
+  с причиной; недоступный TSA → **502**.
+- **XML принимается как есть** (`SignXml`, `verify/xml`), как в NCANode. Раньше весь документ
+  прогонялся через `HtmlDecode`: `&amp;`/`&lt;` в данных ломали XML, а экранированный текст
+  (`&lt;Amount&gt;…`) превращался в настоящие элементы и подписывался ключом сервиса.
+  **Изменение контракта:** клиент, присылавший XML HTML-экранированным, теперь получит ошибку
+  разбора — слать нужно сырой XML в JSON-строке.
 
-### `KalkanCore/BaseOptions/BaseOptions.cs` — ✅ конфиг
-- `KalkanOption.CaCertsPath` — папка PEM-корней (по умолч. отключено = небезопасно).
-- `KalkanOption.OcspResponderUrl` — fallback-URL ответчика.
+### `KalkanCore/BaseOptions/BaseOptions.cs` + `appsettings.json` — ✅ конфиг
+- `KalkanOption.CaCertsPath` — папка PEM-корней; в `appsettings.json` = `/app/Infra/Ca_Certs`.
+- `KalkanOption.OcspResponderUrl` — fallback-URL ответчика; = `http://ocsp.pki.gov.kz`.
+- `KalkanOption.RequireRevocationCheck` — отзыв проверяется всегда; = `true`.
+- `KalkanOption.OcspCacheMinutes` — TTL кэша OCSP (задержка видимости нового отзыва); = `5`.
+- `KalkanOption.TspUrl` — TSA для `withTsp`; = `http://tsp.pki.gov.kz`.
 
-### `CryptCore.Tests/` — ✅ 12 тестов, все зелёные
-- `ChainValidatorTests` (5): боевой NCA-сертификат → trusted; истёкший → reject;
-  чужая иерархия → reject; самоподписанный с поддельным IIN → reject; пустой стор → throw.
+### `KalkanCore/Infra/Ca_Certs` — ✅ добавлена текущая иерархия RSA
+- `nca_rsa_2022.pem` (НУЦ RSA 2022, pathlen 0) и `root_rsa_2020.pem` (корень RSA 2020).
+  Раньше в сторе были только RSA 2015/2018 (`nca_rsa` истёк 25.06.2025) — **любой действующий
+  RSA-сертификат НУЦ, в т.ч. TSA, отклонялся**. Скачаны по AIA (`pki.gov.kz`/`root.gov.kz`),
+  копии по HTTPS байт-в-байт совпали, цепочка проверена `openssl verify`. SHA-256:
+  `nca_rsa_2022` `84fb799a…fb892905`, `root_rsa_2020` `9ba06354…76535dcd` — сверить с
+  опубликованными НУЦ значениями перед продом.
+
+### `CryptCore.Tests/` — ✅ 81 офлайн-тест + 10 live, все зелёные (в `KalkanCore.slnx`)
+- `CmsTests` (8): attached/detached round trip, чужие данные → `messageDigest`, отсоединённая
+  без данных → reject, extract attached/detached; **настоящие ГОСТ-2015 и RSA CMS НУЦ** (метки TSA).
+- `MultiSignerTests` (7): CMS несколькими ключами, добавление подписанта (прежний SignerInfo
+  неизменен), отсоединённая без данных / с чужими данными; XML дважды подписан → оба валидны,
+  подмена содержимого → invalid, удаление первой подписи → invalid.
+- `TimestampTests` (6): метка валидна + время; **истёкший сертификат с меткой до истечения →
+  valid**, с меткой после → invalid; метка не на эту подпись, недоверенный TSA → invalid;
+  добавление подписанта не трогает прежнюю метку.
+- `Pkcs12Tests` (6): алиасы, выбор ключа по алиасу, несколько ключей без алиаса / неизвестный
+  алиас / неверный пароль → ошибка.
+- `CertificateVerificationTests` (6): боевой серт (PEM/DER, GOST-2015/2004) → valid + ИИН/БИН;
+  просроченный, самоподписанный, без trust-store, мусор → invalid.
+- `ChainValidatorTests` (8): боевой NCA-сертификат GOST-2015, GOST-2004, RSA и RSA 2022 → trusted;
+  истёкший → reject; чужая иерархия → reject; самоподписанный с поддельным IIN → reject;
+  пустой стор → throw.
+- `CaConstraintTests` (7): серт, выпущенный не-CA → reject (и end-to-end через CMS с вложенным
+  издателем); CA без keyCertSign → reject; pathLen; ключ без digitalSignature/nonRepudiation → reject.
 - `TrustEnforcementTests` (2): демонстрация уязвимости (без стора подделка проходит) и фикса.
 - `RevocationTests` (5): Revoked/Good/Unknown(fail-closed)/Unknown(soft)/skip — через фейковый
   `IRevocationChecker`, без сети.
+- `CrlRevocationTests` (16): CRL revoked/good/чужая подпись/истёкший/недоступен/нет CDP/кэш;
+  delta: отзыв только в delta, снятие удержания, delta к более новому базовому, delta недоступна,
+  delta по адресу базового; композит OCSP→CRL; OCSP не шлёт запрос для промежуточного CA.
+- `OcspRevocationTests` (10): good от делегированного ответчика и от CA, revoked; ответчик без
+  EKU OCSPSigning, ответ про чужой серийник, чужой nonce, старый ответ без nonce → `Unknown`;
+  кэш на TTL, `Unknown` не кэшируется.
+- `LivePkiTests` (10, только при `KZ_LIVE_PKI=1`): OCSP SHA-256 и SHA-1, CRL корня (ГОСТ-подпись),
+  CRL НУЦ (20 МБ), **отозванный серийник из CRL НУЦ → `Revoked` по OCSP и по CRL**,
+  серийник, отозванный только в delta → `Revoked` по CRL, полная цепочка с OCSP→CRL;
+  TSA НУЦ: ГОСТ-метка строит цепочку до корня, RSA-метка на CMS проверяется и доверена. Запуск:
+  `KZ_LIVE_PKI=1 dotnet test --filter LivePkiTests`.
 
 ---
 
 ## Что нужно сделать (вернуться к фичам)
 
-### 🔴 P0 — включить в проде (`appsettings*.json`)
-Без этого вся проверка доверия **выключена** (приём подписи от любого сертификата):
-```json
-"Kalkan": {
-  "Path": "...", "Key": "...",
-  "CaCertsPath": "Infra/Ca_Certs",
-  "OcspResponderUrl": "http://ocsp.pki.gov.kz"
-}
-```
-И на стороне вызова входящих запросов передавать `ValidateOcsp = true`.
+### 🟡 P1 — наши ГОСТ-подписи против Kalkan
+- *Проверка* ГОСТ-CMS НУЦ теперь подтверждена на настоящих данных (метки TSA). *Подпись*
+  нашим ГОСТ-ключом (CMS/XML/WSSE) против Kalkan/SmartBridge не сверена — нет действующего
+  ГОСТ-ключа (`gost_private_key.pem` пустой; `test_CMS_GOST.txt` — не CMS, а сертификат).
+  Нужен `.p12` и прогон через Kalkan/NCANode или стенд ШЭП.
 
-### 🔴 P0 — интеграционный тест OCSP против живого `ocsp.pki.gov.kz`
-Файл: `OcspRevocationChecker.cs` (поле `CertIdHashAlgorithm`).
-- Подтвердить hash-алгоритм CertID (SHA-256 vs SHA-1). Если ответчик возвращает `Unknown`
-  на заведомо валидный сертификат — переключить на `CertificateID.HashSha1`.
-- Прогнать на **отозванном** тестовом сертификате → ожидаем `Revoked`, а не `Unknown`
-  (иначе fail-closed отклонит всё подряд, но по неверной причине).
-- Этого нет в CI (нужна сеть) — оформить как ручной/опциональный integration-тест.
+### 🟢 P2 — отзыв на время метки
+- С меткой срок сертификата сверяется на её время, но отзыв — на сейчас. Корректнее сравнивать
+  время отзыва (OCSP `revocationTime` / дата в CRL) с временем метки — тогда подпись
+  уволившегося сотрудника, сделанная до отзыва, останется валидной. Нужен `RevocationStatus`
+  со временем отзыва.
 
-### 🟡 P1 — GOST-2004 (старые сертификаты)
-Файлы: `CryptCore/Pki/KzGost.cs` (curve-параметры), `CryptCore.Tests`.
-- Curve-параметры GOST-2004 помечены как «best known» и **не проверены тестом** (нет фикстуры).
-- Если в проде встречаются GOST-2004 сертификаты: добавить такой `.p12`/`.pem` в фикстуры
-  и тест «chains to root». Если подпись CA не сойдётся — задать подлинные параметры через
-  `KzGost.RegisterCurve`.
+### 🟢 P2 — XAdES/CAdES-T для XML
+- Метки времени есть только у CMS. Для XML это XAdES (SignatureTimeStamp в `ds:Object`) — не
+  сделано.
 
-### 🟡 P1 — CRL как fallback к OCSP
-Файлы: новый `CryptCore/Pki/CrlRevocationChecker.cs`, `ChainValidator`.
-- Сейчас при `Unknown` от OCSP (ответчик недоступен) и fail-closed всё отклоняется.
-- Реализовать `IRevocationChecker` поверх CRL (из CDP-расширения сертификата) и
-  композитный чекер «OCSP → при Unknown CRL». ГОСТ-подпись CRL — та же история, что и с OCSP.
-
-### 🟢 P2 — KeyUsage / EKU
+### 🟢 P2 — EKU / политика сертификата
 Файл: `ChainValidator.cs`.
-- Не проверяется назначение ключа (digitalSignature/nonRepudiation) и EKU.
-- Низкий приоритет: НУЦ РК выдаёт сертификаты с корректным usage, но для строгого
-  соответствия стоит добавить проверку.
+- keyUsage проверяется, EKU — нет. НУЦ кладёт в EKU свои OID (`1.2.398.3.3.4.*`: физлицо,
+  сотрудник организации, первый руководитель…). Если сервису важно, *кто* подписал (например,
+  только первый руководитель юрлица), это бизнес-правило поверх `Signers`, а не проверка цепочки.
 
-### 🟢 P2 — кэш OCSP-ответов
-Файл: `OcspRevocationChecker.cs`.
-- Каждый Verify с `ValidateOcsp=true` = сетевой запрос. Закэшировать ответ по
-  (issuer, serial) с учётом `nextUpdate` из ответа, чтобы не бить ответчик на каждый запрос.
-
-### 🟢 P2 — nonce в OCSP-запросе
-Файл: `OcspRevocationChecker.cs` (`BuildRequest`).
-- Сейчас nonce не добавляется (защита от replay). Опционально: НУЦ РК ответчик может его
-  не поддерживать — проверить при интеграционном тесте.
+### ⚪ Иерархия НУЦ 2018 года выведена из оборота
+- Для сертификатов `nca_gost`/`nca_rsa` (2018) OCSP отвечает `malformedRequest`, а их CRL
+  (`crl.pki.gov.kz/nca_gost.crl`, `crl1…`) отдают 404. Статус отзыва получить неоткуда →
+  при включённой проверке отзыва такие подписи отклоняются (`could not be determined`).
+  Это корректный fail-closed; сами CA истекли 25.06.2025, так что текущих подписей там нет.
+  Проверка исторической подписи (`At` в прошлом) возможна только без отзыва.
 
 ### ⚪ Прочее
-- `OcspRevocationChecker` использует синхронный `.GetAwaiter().GetResult()` поверх `HttpClient`
-  внутри синхронного `IRevocationChecker.Check`. Если верификация уйдёт в async-путь —
-  пересмотреть на async-интерфейс.
+- `OcspRevocationChecker` и `CrlRevocationChecker` используют синхронный `.GetAwaiter().GetResult()`
+  поверх `HttpClient` внутри синхронного `IRevocationChecker.Check`. Если верификация уйдёт в
+  async-путь — пересмотреть на async-интерфейс.
+- Первая проверка конечного сертификата при недоступном OCSP блокирует запрос на загрузку
+  20 МБ CRL (~9 с). Можно прогревать CRL фоном при старте.

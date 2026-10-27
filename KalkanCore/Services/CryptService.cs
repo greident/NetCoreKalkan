@@ -13,8 +13,17 @@ public interface ICryptService
     string SignWsseRaw(SignWsseRawDto dto);
     string SignWsseRaw(string envelope, string messageId);
     string SignXml(string messageBody);
+    string SignXml(SignXmlDto dto);
+    byte[] AddCmsSigners(AddCmsSignersDto dto);
+    List<string> Pkcs12Aliases(Pkcs12Dto dto);
+    List<Pkcs12KeyInfoDto> Pkcs12Info(Pkcs12Dto dto);
     VerifyResultDto Verify(VerifyDto dto);
     VerifyResultDto VerifyBase64(VerifyBase64Dto dto);
+    VerifyResultDto VerifyWsse(VerifyWsseDto dto);
+    byte[] SignCms(SignCmsDto dto);
+    VerifyResultDto VerifyCms(VerifyCmsDto dto);
+    CmsExtractResultDto ExtractCms(VerifyCmsDto dto);
+    VerifyResultDto VerifyCertificate(VerifyCertificateDto dto);
 }
 
 public class MockCryptService : ICryptService
@@ -28,22 +37,21 @@ public class MockCryptService : ICryptService
         _options = options.Value;
     }
 
+    // The remote mock signs with its own key only; a key passed in the request is not supported.
     public string SignWsse(SignWsseDto dto)
-    {
-       throw new NotImplementedException();
-    }
+        => dto.Key == null ? SignWsse(dto.MessageBody, dto.MessageId) : throw new NotSupportedException();
 
     public string SignWsse(string messageBody, string messageId)
     {
         var client = _httpClientFactory.CreateClient(nameof(MockCryptService));
 
-        var dto = new SignWsseDto(messageBody, messageBody);
+        var dto = new SignWsseDto(messageBody, messageId);
 
         var request = new HttpRequestMessage
         {
             Method = HttpMethod.Post,
             Content = new StringContent(JsonSerializer.Serialize(dto), Encoding.UTF8, "application/json"),
-            RequestUri = new Uri($"{_options.Url}/crypt/Verify"),
+            RequestUri = new Uri($"{_options.Url}/crypt/SignWsse"),
         };
         using var response = client.Send(request);
         response.EnsureSuccessStatusCode();
@@ -51,6 +59,22 @@ public class MockCryptService : ICryptService
     }
 
     public string SignWsseRaw(SignWsseRawDto dto)
+        => dto.Key == null ? SignWsseRaw(dto.Envelope, dto.MessageId) : throw new NotSupportedException();
+
+    public string SignXml(SignXmlDto dto)
+        => dto.Signers is not { Count: > 0 } ? SignXml(dto.Xml) : throw new NotSupportedException();
+
+    public byte[] AddCmsSigners(AddCmsSignersDto dto)
+    {
+        throw new NotImplementedException();
+    }
+
+    public List<string> Pkcs12Aliases(Pkcs12Dto dto)
+    {
+        throw new NotImplementedException();
+    }
+
+    public List<Pkcs12KeyInfoDto> Pkcs12Info(Pkcs12Dto dto)
     {
         throw new NotImplementedException();
     }
@@ -94,6 +118,31 @@ public class MockCryptService : ICryptService
     }
 
     public VerifyResultDto VerifyBase64(VerifyBase64Dto dto)
+    {
+        throw new NotImplementedException();
+    }
+
+    public VerifyResultDto VerifyWsse(VerifyWsseDto dto)
+    {
+        throw new NotImplementedException();
+    }
+
+    public byte[] SignCms(SignCmsDto dto)
+    {
+        throw new NotImplementedException();
+    }
+
+    public VerifyResultDto VerifyCms(VerifyCmsDto dto)
+    {
+        throw new NotImplementedException();
+    }
+
+    public CmsExtractResultDto ExtractCms(VerifyCmsDto dto)
+    {
+        throw new NotImplementedException();
+    }
+
+    public VerifyResultDto VerifyCertificate(VerifyCertificateDto dto)
     {
         throw new NotImplementedException();
     }
