@@ -19,13 +19,15 @@ namespace CryptCore.Pki;
 ///   * End-entity CRLs are large (~20 MB, refreshed daily), so they serve as the fallback
 ///     when OCSP is unreachable; see <see cref="CompositeRevocationChecker"/>.
 ///
-/// Each CRL is cached in memory until its nextUpdate, as a set of revoked serials, so a
-/// download happens at most once per publication. A CRL past its nextUpdate, signed by
-/// another key or not fetchable yields <see cref="RevocationStatus.Unknown"/>; it is
-/// <see cref="ChainValidator"/> that decides whether "unknown" is fatal (fail-closed).
+/// The base CRL is complemented by the delta CRL named in the certificate's Freshest CRL
+/// extension (nca_d_*.crl, a few KB, refreshed every ~6 h), so a revocation made after the
+/// base was published is seen within hours, not a day. The delta is best effort: if it is
+/// unavailable or does not apply to the cached base, the base alone answers.
 ///
-/// Delta CRLs (nca_d_*.crl) are not consulted: a revocation made after the base CRL was
-/// published becomes visible here only with the next base CRL (up to ~1 day later).
+/// Each CRL is cached in memory until its nextUpdate, as a set of revoked serials, so a
+/// download happens at most once per publication. A base CRL past its nextUpdate, signed
+/// by another key or not fetchable yields <see cref="RevocationStatus.Unknown"/>; it is
+/// <see cref="ChainValidator"/> that decides whether "unknown" is fatal (fail-closed).
 /// </summary>
 public sealed class CrlRevocationChecker : IRevocationChecker
 {
@@ -34,7 +36,13 @@ public sealed class CrlRevocationChecker : IRevocationChecker
     private readonly ConcurrentDictionary<string, CachedCrl> _cache = new();
     private readonly ConcurrentDictionary<string, object> _locks = new();
 
-    private sealed record CachedCrl(HashSet<BigInteger> Revoked, DateTime? NextUpdateUtc);
+    /// <param name="Revoked">Serials listed as revoked (including certificateHold).</param>
+    /// <param name="Released">Delta only: serials taken off hold (reason removeFromCRL).</param>
+    /// <param name="Number">This CRL's cRLNumber.</param>
+    /// <param name="DeltaBase">Delta only: the base cRLNumber the delta applies to.</param>
+    private sealed record CachedCrl(
+        HashSet<BigInteger> Revoked, HashSet<BigInteger> Released,
+        BigInteger? Number, BigInteger? DeltaBase, DateTime? NextUpdateUtc);
 
     /// <param name="http">
     /// HTTP client used to fetch CRLs. End-entity CRLs are large, so give it a timeout
@@ -49,18 +57,31 @@ public sealed class CrlRevocationChecker : IRevocationChecker
 
     public RevocationStatus Check(X509Certificate cert, X509Certificate issuer)
     {
-        foreach (var url in DistributionPoints(cert))
+        foreach (var url in Urls(cert, X509Extensions.CrlDistributionPoints))
         {
-            var crl = GetCrl(url, issuer);
+            var crl = GetCrl(url, issuer, delta: false);
             if (crl == null) continue; // try the next distribution point, if any
+
+            var delta = Urls(cert, X509Extensions.FreshestCrl)
+                .Select(u => GetCrl(u, issuer, delta: true))
+                .FirstOrDefault(d => d != null && AppliesTo(d, crl));
+            if (delta != null)
+            {
+                if (delta.Revoked.Contains(cert.SerialNumber)) return RevocationStatus.Revoked;
+                if (delta.Released.Contains(cert.SerialNumber)) return RevocationStatus.Good;
+            }
             return crl.Revoked.Contains(cert.SerialNumber) ? RevocationStatus.Revoked : RevocationStatus.Good;
         }
         return RevocationStatus.Unknown;
     }
 
+    /// <summary>RFC 5280 §5.2.4: a delta applies to a base whose number is at least its BaseCRLNumber.</summary>
+    private static bool AppliesTo(CachedCrl delta, CachedCrl crl)
+        => delta.DeltaBase != null && crl.Number != null && crl.Number.CompareTo(delta.DeltaBase) >= 0;
+
     // ---- fetch + cache ------------------------------------------------------
 
-    private CachedCrl? GetCrl(string url, X509Certificate issuer)
+    private CachedCrl? GetCrl(string url, X509Certificate issuer, bool delta)
     {
         if (_cache.TryGetValue(url, out var cached) && IsCurrent(cached)) return cached;
 
@@ -71,13 +92,13 @@ public sealed class CrlRevocationChecker : IRevocationChecker
             if (_cache.TryGetValue(url, out cached) && IsCurrent(cached)) return cached;
             _cache.TryRemove(url, out _);
 
-            var fresh = Download(url, issuer);
+            var fresh = Download(url, issuer, delta);
             if (fresh != null && IsCurrent(fresh)) _cache[url] = fresh;
             return fresh != null && IsCurrent(fresh) ? fresh : null;
         }
     }
 
-    private CachedCrl? Download(string url, X509Certificate issuer)
+    private CachedCrl? Download(string url, X509Certificate issuer, bool delta)
     {
         try
         {
@@ -89,11 +110,17 @@ public sealed class CrlRevocationChecker : IRevocationChecker
             // attacker who can answer HTTP could serve an empty list.
             if (!crl.IssuerDN.Equivalent(issuer.SubjectDN) || !IsSignedBy(crl, issuer)) return null;
 
-            var revoked = new HashSet<BigInteger>();
-            foreach (var entry in crl.GetRevokedCertificates() ?? new HashSet<X509CrlEntry>())
-                revoked.Add(entry.SerialNumber);
+            // A base CRL must not be a delta and vice versa, or the semantics get mixed up.
+            var deltaBase = Number(crl, X509Extensions.DeltaCrlIndicator);
+            if (delta != (deltaBase != null)) return null;
 
-            return new CachedCrl(revoked, crl.NextUpdate?.ToUniversalTime());
+            var revoked = new HashSet<BigInteger>();
+            var released = new HashSet<BigInteger>();
+            foreach (var entry in crl.GetRevokedCertificates() ?? new HashSet<X509CrlEntry>())
+                (IsRemoveFromCrl(entry) ? released : revoked).Add(entry.SerialNumber);
+
+            return new CachedCrl(revoked, released, Number(crl, X509Extensions.CrlNumber), deltaBase,
+                crl.NextUpdate?.ToUniversalTime());
         }
         catch
         {
@@ -103,6 +130,19 @@ public sealed class CrlRevocationChecker : IRevocationChecker
 
     private bool IsCurrent(CachedCrl crl)
         => crl.NextUpdateUtc == null || _time.GetUtcNow().UtcDateTime <= crl.NextUpdateUtc;
+
+    private static BigInteger? Number(X509Crl crl, DerObjectIdentifier ext)
+    {
+        var value = crl.GetExtensionValue(ext);
+        return value == null ? null : DerInteger.GetInstance(X509ExtensionUtilities.FromExtensionValue(value)).Value;
+    }
+
+    private static bool IsRemoveFromCrl(X509CrlEntry entry)
+    {
+        var value = entry.GetExtensionValue(X509Extensions.ReasonCode);
+        return value != null &&
+               DerEnumerated.GetInstance(X509ExtensionUtilities.FromExtensionValue(value)).IntValueExact == CrlReason.RemoveFromCrl;
+    }
 
     // ---- CRL trust ----------------------------------------------------------
 
@@ -117,16 +157,17 @@ public sealed class CrlRevocationChecker : IRevocationChecker
         catch { return false; }
     }
 
-    // ---- CDP ----------------------------------------------------------------
+    // ---- CDP / Freshest CRL -------------------------------------------------
 
-    private static IEnumerable<string> DistributionPoints(X509Certificate cert)
+    /// <summary>http(s) URLs of a CRLDistributionPoints-shaped extension (CDP or Freshest CRL).</summary>
+    private static IEnumerable<string> Urls(X509Certificate cert, DerObjectIdentifier extension)
     {
-        var ext = cert.GetExtensionValue(X509Extensions.CrlDistributionPoints);
+        var ext = cert.GetExtensionValue(extension);
         if (ext == null) yield break;
 
         CrlDistPoint cdp;
         try { cdp = CrlDistPoint.GetInstance(X509ExtensionUtilities.FromExtensionValue(ext)); }
-        catch { yield break; } // malformed CDP -> no URL
+        catch { yield break; } // malformed extension -> no URL
 
         foreach (var dp in cdp.GetDistributionPoints())
         {

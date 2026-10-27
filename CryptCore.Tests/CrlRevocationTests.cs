@@ -1,5 +1,6 @@
 using System.Net;
 using CryptCore.Pki;
+using Org.BouncyCastle.Asn1;
 using Org.BouncyCastle.Asn1.X509;
 using Org.BouncyCastle.Crypto;
 using Org.BouncyCastle.Crypto.Generators;
@@ -20,6 +21,7 @@ namespace CryptCore.Tests;
 public class CrlRevocationTests
 {
     private const string CrlUrl = "http://crl.test/ca.crl";
+    private const string DeltaUrl = "http://crl.test/ca_d.crl";
     private static readonly DateTime Now = new(2026, 1, 15, 12, 0, 0, DateTimeKind.Utc);
 
     private sealed class FixedTime(DateTime utc) : TimeProvider
@@ -52,7 +54,7 @@ public class CrlRevocationTests
         return gen.GenerateKeyPair();
     }
 
-    private static Pki NewPki(bool withCdp = true)
+    private static Pki NewPki(bool withCdp = true, bool withDelta = false)
     {
         var caKey = NewRsa();
         var caDn = new X509Name("CN=Test CA,C=KZ");
@@ -79,6 +81,12 @@ public class CrlRevocationTests
             var dp = new DistributionPoint(new DistributionPointName(name), null, null);
             leafGen.AddExtension(X509Extensions.CrlDistributionPoints, false, new CrlDistPoint(new[] { dp }));
         }
+        if (withDelta)
+        {
+            var name = new GeneralNames(new GeneralName(GeneralName.UniformResourceIdentifier, DeltaUrl));
+            var dp = new DistributionPoint(new DistributionPointName(name), null, null);
+            leafGen.AddExtension(X509Extensions.FreshestCrl, false, new CrlDistPoint(new[] { dp }));
+        }
         var leaf = leafGen.Generate(new Asn1SignatureFactory("SHA256WITHRSA", caKey.Private, Rng));
 
         return new Pki(caKey, ca, leaf);
@@ -95,6 +103,27 @@ public class CrlRevocationTests
             gen.AddCrlEntry(serial, Now.AddDays(-1), CrlReason.KeyCompromise);
         return gen.Generate(new Asn1SignatureFactory("SHA256WITHRSA", signWith ?? pki.CaKey.Private, Rng)).GetEncoded();
     }
+
+    /// <summary>
+    /// A base (<paramref name="deltaBase"/> null) or delta CRL carrying cRLNumber
+    /// <paramref name="number"/>; entries are (serial, reason).
+    /// </summary>
+    private static byte[] NumberedCrl(Pki pki, int number, int? deltaBase, params (BigInteger Serial, int Reason)[] entries)
+    {
+        var gen = new X509V2CrlGenerator();
+        gen.SetIssuerDN(pki.Ca.SubjectDN);
+        gen.SetThisUpdate(Now.AddHours(-1));
+        gen.SetNextUpdate(Now.AddHours(6));
+        gen.AddExtension(X509Extensions.CrlNumber, false, new DerInteger(number));
+        if (deltaBase != null)
+            gen.AddExtension(X509Extensions.DeltaCrlIndicator, true, new DerInteger(deltaBase.Value));
+        foreach (var (serial, reason) in entries)
+            gen.AddCrlEntry(serial, Now.AddHours(-2), reason);
+        return gen.Generate(new Asn1SignatureFactory("SHA256WITHRSA", pki.CaKey.Private, Rng)).GetEncoded();
+    }
+
+    private static CrlRevocationChecker CheckerServing(byte[]? crl, byte[]? delta)
+        => new(new HttpClient(new FakeHttp(url => url == CrlUrl ? crl : url == DeltaUrl ? delta : null)), new FixedTime(Now));
 
     private static (CrlRevocationChecker Checker, FakeHttp Http, FixedTime Time) CheckerServing(byte[]? crl)
     {
@@ -172,6 +201,62 @@ public class CrlRevocationTests
         time.Utc = Now.AddHours(3); // past nextUpdate -> cached copy is stale
         checker.Check(pki.Leaf, pki.Ca);
         Assert.Equal(2, http.Calls);
+    }
+
+    // ---- delta CRL -----------------------------------------------------------
+
+    [Fact]
+    public void RevokedOnlyInDelta_IsRevoked()
+    {
+        var pki = NewPki(withDelta: true);
+        var checker = CheckerServing(
+            NumberedCrl(pki, 5, null),
+            NumberedCrl(pki, 6, 5, (pki.Leaf.SerialNumber, CrlReason.KeyCompromise)));
+
+        Assert.Equal(RevocationStatus.Revoked, checker.Check(pki.Leaf, pki.Ca));
+    }
+
+    [Fact]
+    public void HoldReleasedInDelta_IsGood()
+    {
+        var pki = NewPki(withDelta: true);
+        var checker = CheckerServing(
+            NumberedCrl(pki, 5, null, (pki.Leaf.SerialNumber, CrlReason.CertificateHold)),
+            NumberedCrl(pki, 6, 5, (pki.Leaf.SerialNumber, CrlReason.RemoveFromCrl)));
+
+        Assert.Equal(RevocationStatus.Good, checker.Check(pki.Leaf, pki.Ca));
+    }
+
+    [Fact]
+    public void DeltaForNewerBase_IsIgnored()
+    {
+        // The delta lists changes since base #10; our base #5 is older, so the delta's
+        // view cannot be layered on it and the base alone answers.
+        var pki = NewPki(withDelta: true);
+        var checker = CheckerServing(
+            NumberedCrl(pki, 5, null),
+            NumberedCrl(pki, 11, 10, (pki.Leaf.SerialNumber, CrlReason.KeyCompromise)));
+
+        Assert.Equal(RevocationStatus.Good, checker.Check(pki.Leaf, pki.Ca));
+    }
+
+    [Fact]
+    public void DeltaUnavailable_FallsBackToBase()
+    {
+        var pki = NewPki(withDelta: true);
+        var checker = CheckerServing(NumberedCrl(pki, 5, null, (pki.Leaf.SerialNumber, CrlReason.KeyCompromise)), null);
+
+        Assert.Equal(RevocationStatus.Revoked, checker.Check(pki.Leaf, pki.Ca));
+    }
+
+    [Fact]
+    public void DeltaServedAsBaseCrl_IsUnknown()
+    {
+        // A (short) delta at the base URL would make every unlisted serial look good.
+        var pki = NewPki(withDelta: true);
+        var checker = CheckerServing(NumberedCrl(pki, 6, 5), null);
+
+        Assert.Equal(RevocationStatus.Unknown, checker.Check(pki.Leaf, pki.Ca));
     }
 
     // ---- composite -----------------------------------------------------------

@@ -31,32 +31,26 @@ public class MockCryptService : ICryptService
         _options = options.Value;
     }
 
-    public string SignWsse(SignWsseDto dto)
-    {
-       throw new NotImplementedException();
-    }
+    public string SignWsse(SignWsseDto dto) => SignWsse(dto.MessageBody, dto.MessageId);
 
     public string SignWsse(string messageBody, string messageId)
     {
         var client = _httpClientFactory.CreateClient(nameof(MockCryptService));
 
-        var dto = new SignWsseDto(messageBody, messageBody);
+        var dto = new SignWsseDto(messageBody, messageId);
 
         var request = new HttpRequestMessage
         {
             Method = HttpMethod.Post,
             Content = new StringContent(JsonSerializer.Serialize(dto), Encoding.UTF8, "application/json"),
-            RequestUri = new Uri($"{_options.Url}/crypt/Verify"),
+            RequestUri = new Uri($"{_options.Url}/crypt/SignWsse"),
         };
         using var response = client.Send(request);
         response.EnsureSuccessStatusCode();
         return response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
     }
 
-    public string SignWsseRaw(SignWsseRawDto dto)
-    {
-        throw new NotImplementedException();
-    }
+    public string SignWsseRaw(SignWsseRawDto dto) => SignWsseRaw(dto.Envelope, dto.MessageId);
 
     public string SignWsseRaw(string envelope, string messageId)
     {

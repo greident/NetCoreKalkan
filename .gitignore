@@ -60,3 +60,6 @@ nunit-*.xml
 .idea/
 *.sln.iml
 *.DotSettings.user
+
+# macOS
+.DS_Store

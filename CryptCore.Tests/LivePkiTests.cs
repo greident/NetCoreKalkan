@@ -96,10 +96,37 @@ public class LivePkiTests
         gen.SetNotBefore(DateTime.UtcNow.AddDays(-1));
         gen.SetNotAfter(DateTime.UtcNow.AddDays(1));
         gen.SetPublicKey(key.Public);
-        var uri = new GeneralName(GeneralName.UniformResourceIdentifier, NcaGost2022Crl);
-        var dp = new DistributionPoint(new DistributionPointName(new GeneralNames(uri)), null, null);
-        gen.AddExtension(X509Extensions.CrlDistributionPoints, false, new CrlDistPoint(new[] { dp }));
+        gen.AddExtension(X509Extensions.CrlDistributionPoints, false, DistributionPoints(NcaGost2022Crl));
+        gen.AddExtension(X509Extensions.FreshestCrl, false, DistributionPoints(NcaGost2022DeltaCrl));
         return gen.Generate(new Asn1SignatureFactory("SHA256WITHRSA", key.Private));
+    }
+
+    private static CrlDistPoint DistributionPoints(string url)
+    {
+        var uri = new GeneralName(GeneralName.UniformResourceIdentifier, url);
+        return new CrlDistPoint(new[] { new DistributionPoint(new DistributionPointName(new GeneralNames(uri)), null, null) });
+    }
+
+    private const string NcaGost2022DeltaCrl = "http://crl.pki.gov.kz/nca_d_gost_2022.crl";
+
+    // A serial revoked after the current base CRL was published: listed in the delta only.
+    private static readonly Lazy<BigInteger> RevokedInDeltaOnlySerial = new(() =>
+    {
+        var delta = new X509CrlParser().ReadCrl(Http.GetByteArrayAsync(NcaGost2022DeltaCrl).GetAwaiter().GetResult());
+        return delta.GetRevokedCertificates()
+            .First(e => e.GetExtensionValue(X509Extensions.ReasonCode) is not { } r ||
+                        Org.BouncyCastle.Asn1.DerEnumerated.GetInstance(
+                            Org.BouncyCastle.X509.Extension.X509ExtensionUtilities.FromExtensionValue(r))
+                            .IntValueExact != CrlReason.RemoveFromCrl)
+            .SerialNumber;
+    });
+
+    [LiveFact]
+    public void Crl_SerialRevokedInDeltaOnly_IsRevoked()
+    {
+        var crl = new CrlRevocationChecker(Http);
+
+        Assert.Equal(RevocationStatus.Revoked, crl.Check(StandIn(RevokedInDeltaOnlySerial.Value), NcaGost2022()));
     }
 
     [LiveFact]
