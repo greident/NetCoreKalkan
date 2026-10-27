@@ -39,7 +39,10 @@ public class CryptCoreCryptService : ICryptService
             // enforces it (RequireRevocationCheck, see Revocation). OCSP first; CRL covers the
             // issuing CAs (no OCSP responder) and OCSP outages.
             var revocation = new CompositeRevocationChecker(
-                new OcspRevocationChecker(OcspHttp, opt.OcspResponderUrl),
+                new OcspRevocationChecker(OcspHttp, opt.OcspResponderUrl)
+                {
+                    CacheTtl = TimeSpan.FromMinutes(opt.OcspCacheMinutes),
+                },
                 new CrlRevocationChecker(CrlHttp));
             trust = ChainValidator.FromPemDirectory(opt.CaCertsPath, revocation);
             _requireRevocation = opt.RequireRevocationCheck;
@@ -91,6 +94,19 @@ public class CryptCoreCryptService : ICryptService
     public VerifyResultDto VerifyCms(VerifyCmsDto dto)
         => Map(SafeVerify("CMS", () => _crypto.VerifyCms(dto.Cms, dto.Data, Revocation(dto.ValidateOcsp))));
 
+    public CmsExtractResultDto ExtractCms(VerifyCmsDto dto)
+    {
+        // Data comes back only together with the verdict on it, never on its own.
+        var result = Map(SafeVerify("CMS", () => _crypto.VerifyCms(dto.Cms, dto.Data, Revocation(dto.ValidateOcsp))),
+            new CmsExtractResultDto());
+        try { result.Data = dto.Data ?? _crypto.ExtractCms(dto.Cms); }
+        catch { /* malformed CMS: the verdict already says why */ }
+        return result;
+    }
+
+    public VerifyResultDto VerifyCertificate(VerifyCertificateDto dto)
+        => Map(SafeVerify("X.509", () => _crypto.VerifyCertificate(dto.Certificate, Revocation(dto.ValidateOcsp), dto.At)));
+
     // The request's ValidateOcsp flag can turn revocation on, never off when the server requires it.
     private bool Revocation(bool requested) => requested || _requireRevocation;
 
@@ -107,29 +123,33 @@ public class CryptCoreCryptService : ICryptService
         }
     }
 
-    private static VerifyResultDto Map(VerifyResult result)
+    private static VerifyResultDto Map(VerifyResult result) => Map(result, new VerifyResultDto());
+
+    private static T Map<T>(VerifyResult result, T dto) where T : VerifyResultDto
     {
-        var dto = new VerifyResultDto { IsValid = result.Valid, Error = result.Error };
-        var signer = result.Signers.FirstOrDefault();
-        if (signer != null)
-        {
-            dto.CertInfo = new CertificateInfoDto
-            {
-                NotBefore = signer.NotBefore,
-                NotAfter = signer.NotAfter,
-                SerialNumber = signer.SerialNumber,
-                SubjectInfo = new CertificationSubjectInfoDto
-                {
-                    Iin = signer.SubjectInfo.Iin,
-                    Bin = signer.SubjectInfo.Bin,
-                    FirstName = signer.SubjectInfo.FirstName,
-                    MiddleName = signer.SubjectInfo.MiddleName,
-                    LastName = signer.SubjectInfo.LastName,
-                    Email = signer.SubjectInfo.Email,
-                    OrganizationName = signer.SubjectInfo.OrganizationName
-                }
-            };
-        }
+        dto.IsValid = result.Valid;
+        dto.Error = result.Error;
+        dto.Signers = result.Signers.Select(MapCert).ToList();
+        dto.CertInfo = dto.Signers.FirstOrDefault()!;
         return dto;
     }
+
+    private static CertificateInfoDto MapCert(CertificateInfo signer) => new()
+    {
+        NotBefore = signer.NotBefore,
+        NotAfter = signer.NotAfter,
+        SerialNumber = signer.SerialNumber,
+        Issuer = signer.Issuer,
+        KeyAlgorithm = signer.KeyAlgorithm,
+        SubjectInfo = new CertificationSubjectInfoDto
+        {
+            Iin = signer.SubjectInfo.Iin,
+            Bin = signer.SubjectInfo.Bin,
+            FirstName = signer.SubjectInfo.FirstName,
+            MiddleName = signer.SubjectInfo.MiddleName,
+            LastName = signer.SubjectInfo.LastName,
+            Email = signer.SubjectInfo.Email,
+            OrganizationName = signer.SubjectInfo.OrganizationName
+        }
+    };
 }

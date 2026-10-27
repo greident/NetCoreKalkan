@@ -87,6 +87,9 @@
 - Логика: сначала криптопроверка → если ОК и `trust != null` → `trust.Validate(...)`.
   При недоверии `Valid = false` с причиной в `Error`. `Signers` сохраняются для логов.
 - CMS: вшитые в сообщение сертификаты передаются как кандидаты-издатели (но не как анкоры).
+- CMS без содержимого (отсоединённая подпись, `data` не передан) → **невалидна**. Раньше
+  `messageDigest` при отсутствии содержимого не сверялся: проверялась только подпись над
+  атрибутами, и любая настоящая CMS с вырезанным содержимым проходила как `Valid`.
 
 ### `CryptCore/KzCryptoService.cs` — ✅ проброс
 - Опциональный `ChainValidator` в конструкторе/фабриках `FromPkcs12`.
@@ -101,14 +104,26 @@
   несмотря на имя, включает и CRL). При `RequireRevocationCheck = true` отзыв проверяется
   всегда — флаг запроса может только включить проверку, но не выключить.
 - HTTP API: `crypt/verify/xml`, `crypt/verify/xml/base64`, `crypt/verify/wsse`,
-  `crypt/cms/sign`, `crypt/cms/verify`; ответ проверки содержит `Error` с причиной отказа.
+  `crypt/cms/sign`, `crypt/cms/verify`, `crypt/cms/extract`, `crypt/x509/info`; ответ проверки
+  содержит `Error` с причиной отказа и всех подписантов (`Signers`; `CertInfo` — первый).
+  - `cms/extract` отдаёт данные **только вместе с вердиктом** проверки подписи — доверять
+    `Data` можно лишь при `IsValid`.
+  - `x509/info`: разбор сертификата (DER/PEM) + цепочка, срок (на `At`, по умолчанию сейчас),
+    keyUsage, отзыв. Отзыв проверяется на текущий момент, не на `At`.
+- `GET /health`: `Healthy`, если сервис подписи собирается (ключ грузится, trust-store читается);
+  иначе 503 `Unhealthy`. Без этого битый путь/пароль к `.p12` всплывал только на первом запросе.
 
 ### `KalkanCore/BaseOptions/BaseOptions.cs` + `appsettings.json` — ✅ конфиг
 - `KalkanOption.CaCertsPath` — папка PEM-корней; в `appsettings.json` = `/app/Infra/Ca_Certs`.
 - `KalkanOption.OcspResponderUrl` — fallback-URL ответчика; = `http://ocsp.pki.gov.kz`.
 - `KalkanOption.RequireRevocationCheck` — отзыв проверяется всегда; = `true`.
+- `KalkanOption.OcspCacheMinutes` — TTL кэша OCSP (задержка видимости нового отзыва); = `5`.
 
-### `CryptCore.Tests/` — ✅ 47 офлайн-тестов + 8 live, все зелёные (в `KalkanCore.slnx`)
+### `CryptCore.Tests/` — ✅ 59 офлайн-тестов + 8 live, все зелёные (в `KalkanCore.slnx`)
+- `CmsTests` (6): attached/detached round trip, чужие данные → `messageDigest`, отсоединённая
+  без данных → reject, extract attached/detached.
+- `CertificateVerificationTests` (6): боевой серт (PEM/DER, GOST-2015/2004) → valid + ИИН/БИН;
+  просроченный, самоподписанный, без trust-store, мусор → invalid.
 - `ChainValidatorTests` (7): боевой NCA-сертификат GOST-2015, GOST-2004 и RSA → trusted;
   истёкший → reject; чужая иерархия → reject; самоподписанный с поддельным IIN → reject;
   пустой стор → throw.
@@ -144,9 +159,12 @@
   сотрудник организации, первый руководитель…). Если сервису важно, *кто* подписал (например,
   только первый руководитель юрлица), это бизнес-правило поверх `Signers`, а не проверка цепочки.
 
-### 🟢 P2 — TTL кэша OCSP в конфиг
-- `CacheTtl`/`MaxResponseAge` — свойства `OcspRevocationChecker` с дефолтами 5/10 мин; в
-  `KalkanOption` не вынесены. Вынести, если понадобится другая задержка видимости отзыва.
+### ⚪ Иерархия НУЦ 2018 года выведена из оборота
+- Для сертификатов `nca_gost`/`nca_rsa` (2018) OCSP отвечает `malformedRequest`, а их CRL
+  (`crl.pki.gov.kz/nca_gost.crl`, `crl1…`) отдают 404. Статус отзыва получить неоткуда →
+  при включённой проверке отзыва такие подписи отклоняются (`could not be determined`).
+  Это корректный fail-closed; сами CA истекли 25.06.2025, так что текущих подписей там нет.
+  Проверка исторической подписи (`At` в прошлом) возможна только без отзыва.
 
 ### ⚪ Прочее
 - `OcspRevocationChecker` и `CrlRevocationChecker` используют синхронный `.GetAwaiter().GetResult()`

@@ -98,6 +98,16 @@ public static class CmsService
         return result;
     }
 
+    /// <summary>
+    /// The content embedded in an attached CMS, or null for a detached one. Does not
+    /// verify anything — pair it with <see cref="Verify"/> before trusting the bytes.
+    /// </summary>
+    public static byte[]? ExtractContent(byte[] cms)
+    {
+        var signedData = SignedData.GetInstance(ContentInfo.GetInstance(Asn1Object.FromByteArray(cms)).Content);
+        return signedData.EncapContentInfo.Content is Asn1OctetString os ? os.GetOctets() : null;
+    }
+
     private static bool VerifySigner(SignerInfo signer, List<X509Certificate> certs, byte[]? content, VerifyResult result, ChainValidator? trust, bool checkRevocation)
     {
         var cert = FindCert(certs, signer.SignerID);
@@ -107,19 +117,20 @@ public static class CmsService
         var signature = signer.EncryptedDigest.GetOctets();
         var signedAttrs = signer.AuthenticatedAttributes;
 
+        // Without content only the signed attributes could be checked, which proves nothing
+        // about *what* was signed — a detached CMS needs the data passed alongside.
+        if (content == null) { result.Error = "No content to verify (detached CMS: pass the signed data)."; return false; }
+
         bool cryptoOk;
         if (signedAttrs != null)
         {
             // messageDigest attribute must equal the digest of the content.
-            if (content != null)
+            var declared = MessageDigest(signedAttrs);
+            var actual = HashWith(signer.DigestAlgorithm.Algorithm, content);
+            if (declared == null || !declared.SequenceEqual(actual))
             {
-                var declared = MessageDigest(signedAttrs);
-                var actual = HashWith(signer.DigestAlgorithm.Algorithm, content);
-                if (declared == null || !declared.SequenceEqual(actual))
-                {
-                    result.Error = "messageDigest mismatch.";
-                    return false;
-                }
+                result.Error = "messageDigest mismatch.";
+                return false;
             }
             // Signature is over the DER SET OF signed attributes.
             var signedBytes = new DerSet(signedAttrs.ToArray()).GetEncoded(Asn1Encodable.Der);
@@ -127,7 +138,6 @@ public static class CmsService
         }
         else
         {
-            if (content == null) { result.Error = "No content to verify."; return false; }
             cryptoOk = KzSignatures.Verify(cert, content, signature);
         }
 

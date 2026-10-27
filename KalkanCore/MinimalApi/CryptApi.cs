@@ -76,6 +76,22 @@ public static class CryptApi
             .WithName("Калкан верификация CMS")
             .WithOpenApi();
 
+        endpoints.MapPost("crypt/cms/extract", (VerifyCmsDto dto, ICryptService cryptService) =>
+            {
+                var response = cryptService.ExtractCms(dto);
+                return Results.Ok(response);
+            })
+            .WithName("Калкан данные из CMS с проверкой подписи")
+            .WithOpenApi();
+
+        endpoints.MapPost("crypt/x509/info", (VerifyCertificateDto dto, ICryptService cryptService) =>
+            {
+                var response = cryptService.VerifyCertificate(dto);
+                return Results.Ok(response);
+            })
+            .WithName("Калкан информация и проверка сертификата")
+            .WithOpenApi();
+
         return endpoints;
     }
 }

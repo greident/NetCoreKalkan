@@ -18,6 +18,8 @@ public interface ICryptService
     VerifyResultDto VerifyWsse(VerifyWsseDto dto);
     byte[] SignCms(SignCmsDto dto);
     VerifyResultDto VerifyCms(VerifyCmsDto dto);
+    CmsExtractResultDto ExtractCms(VerifyCmsDto dto);
+    VerifyResultDto VerifyCertificate(VerifyCertificateDto dto);
 }
 
 public class MockCryptService : ICryptService
@@ -106,6 +108,16 @@ public class MockCryptService : ICryptService
     }
 
     public VerifyResultDto VerifyCms(VerifyCmsDto dto)
+    {
+        throw new NotImplementedException();
+    }
+
+    public CmsExtractResultDto ExtractCms(VerifyCmsDto dto)
+    {
+        throw new NotImplementedException();
+    }
+
+    public VerifyResultDto VerifyCertificate(VerifyCertificateDto dto)
     {
         throw new NotImplementedException();
     }

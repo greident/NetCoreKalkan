@@ -62,4 +62,42 @@ public sealed class KzCryptoService
 
     public VerifyResult VerifyCms(byte[] cms, byte[]? externalContent = null, bool checkRevocation = true)
         => CmsService.Verify(cms, externalContent, _trust, checkRevocation);
+
+    /// <summary>Content of an attached CMS (null if detached). Not verified — see <see cref="VerifyCms"/>.</summary>
+    public byte[]? ExtractCms(byte[] cms) => CmsService.ExtractContent(cms);
+
+    // ---- X.509 --------------------------------------------------------------
+
+    /// <summary>
+    /// Parse a certificate (DER or PEM) and check it against the trust store: chains to an
+    /// NCA root, in date at <paramref name="atUtc"/> (default: now), key usage, and — with
+    /// <paramref name="checkRevocation"/> — not revoked. <see cref="VerifyResult.Signers"/>
+    /// carries the parsed certificate even when it is rejected. Without a trust store the
+    /// certificate is only parsed and reported as not valid.
+    /// </summary>
+    public VerifyResult VerifyCertificate(byte[] certificate, bool checkRevocation = true, DateTime? atUtc = null)
+    {
+        var result = new VerifyResult();
+        try
+        {
+            var cert = new Org.BouncyCastle.X509.X509CertificateParser().ReadCertificate(certificate)
+                       ?? throw new ArgumentException("No certificate found in the input.");
+            result.Signers.Add(CertificateInfoParser.Parse(cert));
+
+            if (_trust == null)
+            {
+                result.Error = "No trust store configured: the certificate was parsed but not validated.";
+                return result;
+            }
+            var chain = _trust.Validate(cert, atUtc: atUtc, checkRevocation: checkRevocation);
+            result.Valid = chain.Trusted;
+            result.Error = chain.Error;
+        }
+        catch (Exception e)
+        {
+            result.Valid = false;
+            result.Error = e.Message;
+        }
+        return result;
+    }
 }

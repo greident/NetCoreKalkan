@@ -35,4 +35,10 @@ public class KalkanOption
     /// Only takes effect together with <see cref="CaCertsPath"/>.
     /// </summary>
     public bool RequireRevocationCheck { get; init; }
+
+    /// <summary>
+    /// How long an OCSP good/revoked answer is reused — i.e. how late a fresh revocation may
+    /// be noticed. The NCA responder sends no nextUpdate, so this is the only bound. 0 = no cache.
+    /// </summary>
+    public int OcspCacheMinutes { get; init; } = 5;
 }
