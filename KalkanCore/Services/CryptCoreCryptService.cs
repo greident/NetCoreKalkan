@@ -65,31 +65,39 @@ public class CryptCoreCryptService : ICryptService
     public VerifyResultDto Verify(VerifyDto dto)
     {
         var xml = HttpUtility.HtmlDecode(dto.Xml);
-        return Map(SafeVerify(xml, dto.ValidateOcsp));
+        return Map(SafeVerify("XML", () => _crypto.VerifyXml(xml, dto.ValidateOcsp)));
     }
 
     public VerifyResultDto VerifyBase64(VerifyBase64Dto dto)
     {
         var xml = Encoding.UTF8.GetString(dto.XmlData);
-        return Map(SafeVerify(xml, dto.ValidateOcsp));
+        return Map(SafeVerify("XML", () => _crypto.VerifyXml(xml, dto.ValidateOcsp)));
     }
 
-    private VerifyResult SafeVerify(string xml, bool checkRevocation)
+    public VerifyResultDto VerifyWsse(VerifyWsseDto dto)
+        => Map(SafeVerify("WSSE", () => _crypto.VerifyWsse(dto.Envelope, dto.ValidateOcsp)));
+
+    public byte[] SignCms(SignCmsDto dto) => _crypto.SignCms(dto.Data, dto.Detached);
+
+    public VerifyResultDto VerifyCms(VerifyCmsDto dto)
+        => Map(SafeVerify("CMS", () => _crypto.VerifyCms(dto.Cms, dto.Data, dto.ValidateOcsp)));
+
+    private VerifyResult SafeVerify(string format, Func<VerifyResult> verify)
     {
         try
         {
-            return _crypto.VerifyXml(xml, checkRevocation);
+            return verify();
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Ошибка при проверке подписи XML (CryptCore).");
+            _logger.LogError(ex, "Ошибка при проверке подписи {Format} (CryptCore).", format);
             return new VerifyResult { Valid = false, Error = ex.Message };
         }
     }
 
     private static VerifyResultDto Map(VerifyResult result)
     {
-        var dto = new VerifyResultDto { IsValid = result.Valid };
+        var dto = new VerifyResultDto { IsValid = result.Valid, Error = result.Error };
         var signer = result.Signers.FirstOrDefault();
         if (signer != null)
         {

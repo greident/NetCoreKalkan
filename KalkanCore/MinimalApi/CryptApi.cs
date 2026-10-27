@@ -51,7 +51,31 @@ public static class CryptApi
             })
             .WithName("Калкан верификация xml base64")
             .WithOpenApi();
-        
+
+        endpoints.MapPost("crypt/verify/wsse", (VerifyWsseDto dto, ICryptService cryptService) =>
+            {
+                var response = cryptService.VerifyWsse(dto);
+                return Results.Ok(response);
+            })
+            .WithName("Калкан верификация Soap WSSE")
+            .WithOpenApi();
+
+        endpoints.MapPost("crypt/cms/sign", (SignCmsDto dto, ICryptService cryptService) =>
+            {
+                var response = cryptService.SignCms(dto);
+                return Results.Text(Convert.ToBase64String(response));
+            })
+            .WithName("Калкан подпись CMS (base64)")
+            .WithOpenApi();
+
+        endpoints.MapPost("crypt/cms/verify", (VerifyCmsDto dto, ICryptService cryptService) =>
+            {
+                var response = cryptService.VerifyCms(dto);
+                return Results.Ok(response);
+            })
+            .WithName("Калкан верификация CMS")
+            .WithOpenApi();
+
         return endpoints;
     }
 }

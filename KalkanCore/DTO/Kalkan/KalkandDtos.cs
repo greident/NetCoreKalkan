@@ -5,10 +5,16 @@ public record SignWsseDto(string MessageBody, string MessageId);
 public record SignWsseRawDto(string Envelope, string MessageId);
 public record VerifyDto(string Xml, bool ValidateOcsp);
 public record VerifyBase64Dto(byte[] XmlData, bool ValidateOcsp);
+public record VerifyWsseDto(string Envelope, bool ValidateOcsp);
+public record SignCmsDto(byte[] Data, bool Detached);
+public record VerifyCmsDto(byte[] Cms, byte[]? Data, bool ValidateOcsp);
 
 public class VerifyResultDto
 {
     public bool IsValid { get; set; }
+
+    /// <summary>Причина отказа (крипто, цепочка, срок, отзыв); null при успехе.</summary>
+    public string? Error { get; set; }
 
     public CertificateInfoDto CertInfo { get; set; }
 }

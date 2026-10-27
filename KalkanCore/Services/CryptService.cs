@@ -15,6 +15,9 @@ public interface ICryptService
     string SignXml(string messageBody);
     VerifyResultDto Verify(VerifyDto dto);
     VerifyResultDto VerifyBase64(VerifyBase64Dto dto);
+    VerifyResultDto VerifyWsse(VerifyWsseDto dto);
+    byte[] SignCms(SignCmsDto dto);
+    VerifyResultDto VerifyCms(VerifyCmsDto dto);
 }
 
 public class MockCryptService : ICryptService
@@ -94,6 +97,21 @@ public class MockCryptService : ICryptService
     }
 
     public VerifyResultDto VerifyBase64(VerifyBase64Dto dto)
+    {
+        throw new NotImplementedException();
+    }
+
+    public VerifyResultDto VerifyWsse(VerifyWsseDto dto)
+    {
+        throw new NotImplementedException();
+    }
+
+    public byte[] SignCms(SignCmsDto dto)
+    {
+        throw new NotImplementedException();
+    }
+
+    public VerifyResultDto VerifyCms(VerifyCmsDto dto)
     {
         throw new NotImplementedException();
     }
